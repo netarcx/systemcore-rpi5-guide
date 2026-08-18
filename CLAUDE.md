@@ -128,14 +128,33 @@ carries `bcm2712-rpi-5-b.dtb`, an `[all]` config.txt section, and a real `cmdlin
   - p4: data (~256M)
 - Beta 10+ kernel: Linux 6.12.77, 16K pages (stock kernel works on Pi 5B; still 6.12.77-v8-16k in Beta 14)
 - Alpha 2 kernel: Linux 6.6.45, 4K pages (needs Pi 5B DTB from patcher/resources/alpha2/)
-- Pi 5B external USB: xhci-hcd.0 (bus 1, ports 1-1 through 1-2)
+- Pi 5B USB topology, as observed on hardware running Beta 14 (identical controller
+  addresses to the CM5 — same BCM2712 + RP1 silicon):
+  - `xhci-hcd.0` (`1f00200000.usb`) → `usb1`/`usb2`: the two blue **USB 3.0** ports. USB-CAN
+    adapters landed here as `1-1`, `1-2`.
+  - `xhci-hcd.1` (`1f00300000.usb`) → `usb3`/`usb4`: the two black **USB 2.0** ports. Camera on
+    `3-1`, RP2350 (`cafe:4011`) on `3-2`.
+  - This distinction matters for cameras: only the USB 2.0 ports can produce a `3-x` path.
 - Pico after flash: VID=0xCAFE PID=0x4011 ("Limelight RT Subsystem")
 - CAN udev match: `ATTR{type}=="280"` (ARPHRD_CAN, matches any CAN netdev). The build's `90-usb-can-rename.rules` adds `SUBSYSTEMS=="usb"` so vcan interfaces (no parent device) don't match — without that constraint, adding a vcan from inside canbusprocess re-triggers canbusprocess and infinite-loops.
 - CAN FD: 1Mbps nominal / 5Mbps data bitrate, falls back to 1Mbps standard CAN if adapter doesn't support FD
 - CAN port mapping persisted to `/etc/can_port_map` (port path -> can_sN index)
 - HAL CAN expectation: WPILib's HAL (`libwpiHal.so`, `_GLOBAL__N_1::SocketCanState::InitializeBuses`) does `SIOCGIFINDEX` on `can_s0` through `can_s4`. ANY missing one → `IllegalStateException: Failed to initialize. Terminating` from `org.wpilib.framework.RobotBase.startRobot`. canbusprocess fills gaps with vcan after USB-CAN setup.
 - HAL netcomm gate: HAL also blocks on NT key `/Netcomm/Control/ServerReady` (string lives in `libwpiHal.so`). The setter is `/usr/bin/MrcCommDaemon` (`mrccomm.service`), which opens `/dev/mrccan/controldata` + `/dev/mrccan/matchinfo` (`O_WRONLY|O_CREAT|O_TRUNC`). Those paths are the misc devices registered by the `robot_heartbeat` module (`kernel/net/can/robot_heartbeat.ko.xz`, depends on `can_sender`) — not carrier-board-specific hardware, it just has to be loaded, which the build now does via `/etc/modules-load.d/systemcore-pi5b.conf`. `/etc/tmpfiles.d/mrccan.conf` remains as the fallback: with the bare directory present, MrcCommDaemon creates plain files and still publishes ServerReady. Without either: `Failed to open control data file` → mrccomm crash-loops → HAL `Waiting for server ready failed` → SIGABRT (exit 134) ~10s after Java starts.
-- RP2350 firmware faults (BROWNOUT, IMU, DISPLAY, CAN, RSL) are cosmetic — closed-source firmware expects carrier board hardware
+- Dashboard fault chain: RP2350 firmware → (libusb) `iodaemon` → NT `sys/faults` (struct
+  `IOFaults`: brownout, io, rsl, usb, display, imu + counts) → `hwmon` (which adds
+  `canbus_down`/`canbus_unavail` read from `can_s0..can_s4` itself) → websocket `hw` payload
+  (`f` bitmask, `fc` counts) → dashboard. Bit order is
+  `[BROWNOUT, I/O, RSL, USB, DISPLAY, IMU, CAN STATUS, CAN AVAIL]`, decoded as `0!==(t&1<<i)`.
+- BROWNOUT / I/O / DISPLAY / IMU (bits 0,1,4,5) are permanently faulted on a Pi 5B and are
+  cosmetic: the closed RP2350 firmware expects carrier-board circuits (battery monitor, Smart
+  I/O short detection, display, I2C IMU) that don't exist. They re-fire every poll, so the
+  counts climb ~100/s. CAN STATUS (bit 6) is **not** cosmetic — `hwmon` derives it from the
+  real `can_s*` state, so it also fires when a USB-CAN adapter genuinely drops, and it is
+  expected while most buses are vcan placeholders. Suppressing bits 0,1,4,5 means masking with
+  `0xCC`; leave bit 6 visible or you lose a working diagnostic. `iodaemon` has no config or
+  CLI switch to quiet them; masking `limelight_iodaemon.service` kills bits 0-5 at the source
+  (and also the IMU / Smart I/O topics, none of which exist on a Pi 5B).
 - Dashboard patches: sed on minified React JS (`main.*.js`), applied to every rootfs slot present. The fault-reset button injection must read the minified react/jsx-runtime alias out of the surrounding code (`xo` in Beta 10, `bo` in Beta 14) — hardcoding it throws a ReferenceError and blanks the dashboard. `node --check` on the patched JS catches this.
 - Interface renaming done in canbusprocess service (NOT udev PROGRAM — `ip link show` is unreliable in udev context)
 - Systemd ExecStart must not use `${VAR##pattern}` syntax — systemd strips `${...}` before bash sees it
@@ -143,6 +162,67 @@ carries `bcm2712-rpi-5-b.dtb`, an `[all]` config.txt section, and a real `cmdlin
 - Upstream ships `limelight_canbusprocess.service` as `Type=oneshot`/`RemainAfterExit=yes` (Beta 14). Our drop-in's ExecStart never returns and sets `Restart=always`, which systemd refuses on a oneshot unit ("isn't allowed for Type=oneshot services. Refusing.") — so the drop-in also sets `Type=simple`/`RemainAfterExit=no`. Check drop-ins against a new release with `systemd-analyze verify <unit>` before flashing.
 - Upstream `robot.service` (Beta 14) waits up to 15s for `can_s0..can_s4` to be `state UP` and starts anyway on timeout; our override replaces that ExecStartPre with a 30s wait
 - Upstream `70-can-interface-names.rules` names the carrier board's SPI CAN controllers (`spi2.0` → `can_s0`, etc.). It never matches on Pi 5B since the SPI overlays are commented out, so it doesn't conflict with `90-usb-can-rename.rules`.
+
+## USB cameras require a USB hub (confirmed on hardware)
+
+A USB camera plugged **directly** into a Pi 5B is found by the kernel (`uvcvideo` loads,
+`/dev/video0` appears, `lsusb` lists it) but never shows up on the dashboard's camera page.
+Every vision server logs:
+
+```
+Camera initialization failed (no camera on this port)
+```
+
+Each `visionserverN` canonicalises the camera's sysfs path and compares it against one
+hardcoded path that includes the **carrier board's internal 4-port USB hub**:
+
+```
+camera plugged straight in : .../xhci-hcd.1/usb3/3-1/3-1:1.0          (84 bytes)
+what visionserver expects  : .../xhci-hcd.1/usb3/3-1/3-1.1/3-1.1:1.0  (92 bytes)
+```
+
+Everything up to `usb3/3-1/` already matches — the Pi 5B exposes the same controllers as the
+CM5. The only thing missing is the hub level.
+
+**Fix: plug a USB hub into the USB 2.0 port that enumerates as `3-1`, camera into the hub.**
+The path becomes `3-1.1/3-1.1:1.0`, which matches the stock binary exactly — no patching, and
+it survives upstream updates. It must be a USB 2.0 (black) port; the blue USB 3.0 ports are on
+`xhci-hcd.0` (buses 1/2) and can never produce a `3-x` path.
+
+Port ownership per instance (`usb_id` in `/usr/local/bin/visionserverN/global.settings`, also
+settable via the dashboard's `set_usb_id` API):
+
+| instance | `usb_id: 0` | `usb_id: 1` |
+| --- | --- | --- |
+| `visionserver` | `3-1.1` | — |
+| `visionserver1` | `3-1.1` | `3-1.2` |
+| `visionserver2` | `3-1.1` | `3-1.3` |
+| `visionserver3` | `3-1.1` | `3-1.4` |
+
+All four ship with `usb_id: 0`, so they all target `3-1.1` and only the first to claim it wins —
+the others keep logging "no camera on this port", which is expected, not a fault. For a second
+camera, use hub port 2 and set that instance's `usb_id` to 1.
+
+Do **not** try to fix this by patching the path string in the binary: it was tested, and the
+comparison length is baked in, so the shorter Pi 5B path plus NUL padding still fails to match.
+Making that work would mean rewriting the length immediate in the instruction stream.
+
+A camera that isn't in Limelight's database comes up as `generic-UVC` (logged as
+`USB camera generic-UVC (...): locked to 1280x720@30 MJPG`) — it streams, but there is no
+factory calibration or lens profile, so calibrate before trusting pose estimates.
+
+Useful commands when a camera doesn't appear:
+
+```bash
+lsusb                                              # is it enumerated at all?
+lsmod | grep uvcvideo                              # driver loaded?
+readlink -f /sys/class/video4linux/video0/device   # the path that must match the table above
+journalctl -u limelight_visionserver -n 50 --no-pager | grep -i camera
+```
+
+Note this Buildroot userspace has **no `timeout`, `pkill` or `pgrep`** — use `killall`/`pidof`
+and the background-then-sleep-then-kill pattern. `strace` and `ltrace` are both present, and
+tracing `%file` is how the path comparison above was identified.
 
 ## Diagnosing a non-starting robot.service on an already-flashed image
 
@@ -161,7 +241,14 @@ sudo journalctl -u robot.service -n 50 --no-pager
 - Host: WSL2 on Windows (Ubuntu/Debian)
 - Target: Raspberry Pi 5 Model B (BCM2712), ARM64
 - SystemCore version: 2027.0.0 Beta 14 (limelightosr-2027.0.0-beta14-201)
-- Test Pi: systemcore@10.0.0.167 (password: systemcore)
+- Confirmed on hardware (Pi 5B, Beta 14 image built by this repo, Aug 2026): boots from SD;
+  `limelight_expandfs` grew rootfs A to 6.8G (5.1G free); two USB-CAN adapters enumerate on
+  `1-1`/`1-2`; RP2350 present as `cafe:4011` on `3-2`; USB camera works once behind a hub.
+  Still unverified: whether `robot_heartbeat` wins the race for `/dev/mrccan` (check
+  `ls -l /dev/mrccan` — character devices = module won, regular files = tmpfile fallback).
+- Test Pi: `ssh systemcore@172.30.0.1` (password: systemcore) — the wlan0 AP address, reachable
+  when the host is joined to the Pi's access point. Older notes list 10.0.0.167/10.0.0.169;
+  those were LAN leases and are stale.
 
 ## Network boot (for development)
 

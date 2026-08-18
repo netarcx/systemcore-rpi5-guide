@@ -149,6 +149,17 @@ Place `debugfs.exe` in `patcher_win/tools/` — see the README there for where t
 Verify the result with `e2fsck -fn` on the rootfs partition if you want extra confidence; a
 correct run reports no errors.
 
+### USB cameras need a USB hub
+
+A camera plugged straight into the Pi 5B enumerates fine but never appears on the dashboard's
+camera page — the vision servers match cameras against a sysfs path that includes the Limelight
+carrier board's internal USB hub, which a Pi 5B doesn't have.
+
+**Plug a USB hub into one of the black USB 2.0 ports and the camera into the hub.** The path
+then matches what the stock software expects, with no patching. The blue USB 3.0 ports are on a
+different controller and won't work for this. See CLAUDE.md for the port-to-instance mapping if
+you want more than one camera.
+
 ## What `build-image.sh` does
 
 The script automates everything needed to convert the upstream CM5 image into a Pi 5B-compatible image:
