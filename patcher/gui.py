@@ -50,6 +50,13 @@ class PatcherGUI:
         ("disable_spi_can", "Disable SPI CAN overlays"),
         ("update_cmdline", "Add panic=0 + US wifi regdom"),
     ]
+    ALPHA_BOOT_PATCHES = [
+        ("fix_autoboot", "Disable autoboot.txt redirect"),
+        ("fix_config_sections", "Fix config.txt [all] section"),
+        ("fix_cmdline_reference", "Create cmdline.txt"),
+        ("install_pi5b_dtb", "Install Pi 5B device tree"),
+        ("comment_pi4_firmware", "Comment out Pi 4 firmware"),
+    ]
     ROOTFS_PATCHES = [
         ("install_flash_pico", "Install flash-pico.sh"),
         ("install_can_udev", "USB-CAN udev rule"),
@@ -57,6 +64,7 @@ class PatcherGUI:
         ("install_canbuswatchdog", "canbuswatchdog override"),
         ("install_robot_override", "robot.service override"),
         ("install_mrccan", "/dev/mrccan tmpfile (MrcCommDaemon fix)"),
+        ("install_modules_load", "Load robot_heartbeat + i2c-dev at boot"),
         ("install_regdb", "Wireless regulatory database"),
         ("patch_dashboard_wlan", "Dashboard: unlock WLAN0 AP"),
         ("patch_dashboard_faults", "Dashboard: fault count reset button"),
@@ -65,8 +73,8 @@ class PatcherGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("SystemCore Pi 5B Image Patcher")
-        self.root.geometry("980x980")
-        self.root.minsize(820, 820)
+        self.root.geometry("1080x980")
+        self.root.minsize(1020, 820)
 
         self.opts = core.PatchOptions()
         self.toggle_vars: dict[str, tk.BooleanVar] = {}
@@ -105,9 +113,11 @@ class PatcherGUI:
         patches.pack(fill="x")
         patches.columnconfigure(0, weight=1)
         patches.columnconfigure(1, weight=1)
+        patches.columnconfigure(2, weight=1)
 
-        self._patch_column(patches, 0, "Boot partitions (A + B)", self.BOOT_PATCHES)
-        self._patch_column(patches, 1, "Rootfs (A + B)", self.ROOTFS_PATCHES)
+        self._patch_column(patches, 0, "Boot (shared)", self.BOOT_PATCHES)
+        self._patch_column(patches, 1, "Boot (Alpha 2-10 only)", self.ALPHA_BOOT_PATCHES)
+        self._patch_column(patches, 2, "Rootfs (every slot present)", self.ROOTFS_PATCHES)
 
         # Advanced / debugging options
         adv = ttk.LabelFrame(self.root, text="Debug + advanced", padding=8)

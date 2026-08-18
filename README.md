@@ -10,13 +10,19 @@ cd systemcore-rpi5-guide
 sudo ./build-image.sh
 ```
 
-This produces `systemcore-pi5b-beta10-v1.img` — flash it to an SD card and boot:
+This produces `systemcore-pi5b-2027.0.0-beta14-v1.img` — flash it to an SD card and boot:
 
 ```bash
-sudo dd if=systemcore-pi5b-beta10-v1.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v1.img of=/dev/sdX bs=4M status=progress
 ```
 
 Insert the SD card into your Pi 5 and power on. No further configuration needed.
+On first boot the stock `limelight_expandfs` service grows rootfs A to 7 GiB and
+creates the (empty) B slot — that's upstream behavior, not something this project adds.
+
+To build against a different upstream release, edit `RELEASE_TAG` / `RELEASE_NAME`
+at the top of `build-image.sh`, or just point `patch-image.py` at any downloaded
+image (see below).
 
 ## Patching new upstream releases (`patch-image.py`)
 
@@ -30,7 +36,23 @@ sudo python3 patch-image.py
 sudo python3 patch-image.py upstream.img -o patched.img
 ```
 
-The patcher detects partition offsets dynamically (via `sfdisk`), so it survives layout changes between releases. It applies the same set of patches `build-image.sh` does, but skips the image download.
+The patcher detects partition offsets dynamically (via `sfdisk`), so it survives layout changes between releases. It applies the same set of patches `build-image.sh` does, but skips the image download. It accepts either the release `.zip` or an already-extracted `.img`.
+
+### Image families
+
+| Family | Releases | Layout |
+| --- | --- | --- |
+| `ab` | Beta 10+ and Alpha 11+ | boot selector + boot A/B + rootfs A/B |
+| `alpha` | Alpha 2-10 | single boot partition + rootfs A/B + data |
+
+Auto-detected from the partition table; override with `--image-type` if needed.
+
+Since Beta 14 / Alpha 14 the images ship **packed**: rootfs A is shrunk to its filesystem
+size and rootfs B is declared in the partition table but isn't in the file at all. The
+patcher notices this, patches rootfs A, and says so in the log. Slot B is created empty on
+first boot by the stock `expandfs.sh` and is only ever filled by an OTA update, which
+overwrites the whole slot — so there is nothing there to patch, and an OTA to slot B drops
+these patches by design.
 
 ### CLI options
 
@@ -47,6 +69,7 @@ sudo python3 patch-image.py [input.img] [options]
   --validate                Re-mount the output and verify expected files
   --inspect                 Mount partitions, print paths, wait for ENTER
   --show-partitions         Print partition layout and exit
+  --image-type TYPE         Force image family: auto (default), ab, or alpha
   --list-patches            List every patch with a description
   --only PATCH,PATCH        Apply only these patches (everything else off)
   --no-<patch>              Skip a single patch (e.g. --no-install-mrccan)
@@ -84,6 +107,7 @@ Each path has a Browse button if the default isn't right.
 - `canbuswatchdog override` — install watchdog override that waits for any `can_s*` instead of requiring all 5
 - `robot.service override` — 30-second CAN wait then start regardless
 - `/dev/mrccan tmpfile (MrcCommDaemon fix)` — install `tmpfiles.d/mrccan.conf` so `MrcCommDaemon` can write its control files at boot (without this the robot program SIGABRTs ~10s after start)
+- `Load robot_heartbeat + i2c-dev at boot` — install `modules-load.d/systemcore-pi5b.conf`. `robot_heartbeat` registers the real `/dev/mrccan/*` devices; upstream loads it from the CAN service ExecStart this project overrides
 - `Wireless regulatory database` — install `regulatory.db` so WiFi works on the US regdom
 - `Dashboard: unlock WLAN0 AP` — patch the minified React JS to allow editing Access Point network config
 - `Dashboard: fault count reset button` — add a "Reset Fault Counts" button to the fault tooltip in the header
@@ -97,11 +121,11 @@ Hover any checkbox for a tooltip explaining what that patch does.
 - `Keep mounted after` — leave the partition loop-mounts open on success so you can poke around with a file manager or shell. Cleanup is your problem.
 - `No cleanup on error` — leave the loop-mounts open if a patch fails, so you can inspect partial state. Use for diagnosing why a patch broke.
 - `Patch A only (skip B)` — only patches the A boot+rootfs, leaves B alone. Useful when testing a patch against just one boot slot.
-- `Validate after patch` — re-mount the output image and verify the expected files (override.conf paths, tmpfile config, flash-pico.sh) are present in both rootfs A and B.
+- `Validate after patch` — re-mount the output image and verify the expected files (override.conf paths, tmpfile config, flash-pico.sh) are present in every rootfs slot the image actually contains.
 
 **6. Action buttons:**
 - `Patch image` — apply all enabled patches. Disabled while a job is running.
-- `Inspect (mount only)` — mount every partition (boot A/B, rootfs A/B) on the input or output image and show a dialog with the mount points. Click OK in the dialog when done to unmount everything.
+- `Inspect (mount only)` — mount every partition present in the image (boot A/B, rootfs A/B) on the input or output image and show a dialog with the mount points. Click OK in the dialog when done to unmount everything.
 - `Validate` — re-mount the output (or input) image and verify expected post-patch files are present. Pops up a dialog reporting any missing files.
 - `Show partitions` — print the partition layout (offsets, sizes, detected filesystems, identified boot/root A/B mapping) to the log.
 - `Cancel` — set a cancel flag the worker can observe. Subprocess calls already in flight aren't interrupted, so this is "best effort" rather than instant.
@@ -109,13 +133,35 @@ Hover any checkbox for a tooltip explaining what that patch does.
 
 **7. Progress bar + status + log viewer** — the bottom half is a scrolling log with timestamps. Errors render red, warnings amber, debug messages grey. `Clear` empties the log; `Save log...` writes it to a file (handy for sharing diagnostics).
 
+### Windows-native patcher (`patch-image-win.py`)
+
+For patching without WSL. Same patches, but it reads/writes the partitions directly instead of
+mounting them: `pyfatfs` for the FAT32 boot partitions, `debugfs` (e2fsprogs) for the ext4 rootfs.
+
+```
+pip install pyfatfs setuptools     # setuptools: pyfilesystem2 still imports pkg_resources
+python patch-image-win.py                       # GUI
+python patch-image-win.py image.zip -o out.img --validate
+```
+
+Place `debugfs.exe` in `patcher_win/tools/` — see the README there for where to get it.
+
+Verify the result with `e2fsck -fn` on the rootfs partition if you want extra confidence; a
+correct run reports no errors.
+
 ## What `build-image.sh` does
 
 The script automates everything needed to convert the upstream CM5 image into a Pi 5B-compatible image:
 
-1. **Downloads** the upstream SystemCore Beta 10 image from GitHub (cached after first download)
-2. **Patches both boot partitions** (A/B) — enables HDMI, disables SPI CAN overlays, updates cmdline
-3. **Patches both rootfs partitions** (A/B) — installs Pico flasher, CAN adapter support, dashboard patches
+1. **Downloads** the upstream SystemCore image from GitHub (cached after first download)
+2. **Hands it to `patch-image.py`**, which finds the partitions with `sfdisk` — offsets move
+   between releases, so nothing is hardcoded — and applies every patch
+3. **Patches both boot partitions** (A/B) — enables HDMI, disables SPI CAN overlays, updates cmdline
+4. **Patches every rootfs slot present in the image** — installs Pico flasher, CAN adapter
+   support, the `/dev/mrccan` devices, and the dashboard patches
+
+Patch definitions live in `patcher/` and `patcher/resources/`, so `build-image.sh` and
+`patch-image.py` cannot drift apart.
 
 ## What gets patched
 
@@ -157,9 +203,12 @@ Compatible with any SocketCAN-supported USB adapter (candleLight/canable, PEAK, 
 
 `MrcCommDaemon` is the userspace service that sets the NetworkTables key `/Netcomm/Control/ServerReady`. The WPILib HAL waits on this key during robot startup — if `MrcCommDaemon` isn't running, the Java robot program SIGABRTs ~10 seconds after launch with `Error: Waiting for server ready failed. Restarting app and retrying...` and `terminate called without an active exception`.
 
-The daemon writes its state to `/dev/mrccan/controldata` and `/dev/mrccan/matchinfo`. On real SystemCore hardware that directory is created by a kernel module specific to the carrier board; on Pi 5B the module doesn't exist, so the daemon crash-loops with `Failed to open control data file`.
+The daemon writes its state to `/dev/mrccan/controldata` and `/dev/mrccan/matchinfo`. Those are misc devices registered by the `robot_heartbeat` kernel module (which pulls in `can_sender`) — both ship in the image and are plain software modules, so they load fine on a Pi 5B. The catch: upstream only loads them from the tail of `limelight_canbusprocess.service`'s ExecStart, which this project replaces wholesale to drive USB-CAN adapters. Without the modprobe the devices never appear and the daemon crash-loops with `Failed to open control data file`.
 
-The build script installs `/etc/tmpfiles.d/mrccan.conf` so systemd-tmpfiles creates `/dev/mrccan/` early in boot, before `mrccomm.service` starts. Both files are then regular files written by the daemon itself.
+So the build does both:
+
+- installs `/etc/modules-load.d/systemcore-pi5b.conf` (`robot_heartbeat`, `i2c-dev`) so the devices are registered early in boot, before `mrccomm.service` starts
+- keeps `/etc/tmpfiles.d/mrccan.conf` as a fallback — with the bare `/dev/mrccan/` directory present, the daemon creates plain files there and still publishes `ServerReady`
 
 ### Dashboard patches
 
@@ -194,6 +243,7 @@ patcher/                - Python package for patch-image.py
     robot-override.conf
     picoflasher-override.conf
     mrccan.conf
+    modules-load.conf
 netboot/                - Network boot setup (development/debugging)
   flash-pico.sh         - Pico flasher replacement (installed into image)
   setup-netboot.sh      - Sets up TFTP + NFS on WSL2 for netboot
@@ -203,7 +253,7 @@ netboot/                - Network boot setup (development/debugging)
 Files not tracked in git (generated/downloaded):
 ```
 cache/                            - Downloaded upstream image zip
-systemcore-pi5b-beta10-v1.img     - Output image (~14GB)
+systemcore-pi5b-2027.0.0-beta14-v1.img   - Output image (~2.2GB, expands to 14GB on first boot)
 netboot/tftpboot/                 - TFTP boot files (kernel, DTBs, overlays)
 netboot/nfsroot/                  - NFS root mount point
 ```
@@ -221,14 +271,17 @@ This installs `tftpd-hpa` and `nfs-kernel-server`, configures exports, and print
 ## Prerequisites
 
 - Linux host for building (Ubuntu/Debian, WSL2 works)
-- ~15GB free disk space (upstream image + patched output)
+- ~6GB free disk space for the current packed images (upstream zip + extracted + patched
+  output); older, full-size releases need ~35GB
 - `sudo` access (for loop-mounting image partitions)
 
 ## Tested on
 
 - Raspberry Pi 5 Model B (4GB/8GB)
-- SystemCore Beta 10 (`limelightosr-beta-10-139`)
-- Kernel: stock upstream 16K-page kernel (works on Pi 5B as-is since Beta 10)
+- SystemCore 2027.0.0 Beta 14 (`limelightosr-2027.0.0-beta14-201`) and Alpha 14
+  (`limelightosr-2027.0.0-alpha14-371`) — both ship the same partition layout and patch identically
+- Also supports Beta 10-13 and the older Alpha 2-10 single-boot-partition layout
+- Kernel: stock upstream 16K-page kernel, 6.12.77 (works on Pi 5B as-is since Beta 10)
 - Host: WSL2 on Windows 11
 
 ## License

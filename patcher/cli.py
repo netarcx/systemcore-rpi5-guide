@@ -66,6 +66,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--validate", action="store_true",
                    help="Re-mount the output image and verify expected files.")
 
+    p.add_argument("--image-type", choices=["auto", "alpha", "ab", "beta", "beta10"],
+                   default="auto",
+                   help="Force image type: 'alpha' for the Alpha 2-10 single-boot "
+                        "layout, 'ab' for the Beta 10+ / Alpha 11+ A/B layout "
+                        "('beta'/'beta10' are accepted spellings of 'ab'). "
+                        "Default: auto-detect from partition layout.")
+
     # Diagnostic-only modes
     p.add_argument("--inspect", action="store_true",
                    help="Mount partitions, print paths, and wait for ENTER.")
@@ -123,6 +130,7 @@ def options_from_args(args: argparse.Namespace) -> core.PatchOptions:
     opts.flash_pico_path = Path(args.flash_pico)
     opts.regdb_deb_path = Path(args.regdb)
 
+    opts.force_image_type = core.IMAGE_TYPE_ALIASES.get(args.image_type)
     opts.dry_run = args.dry_run
     opts.verbose = args.verbose
     opts.backup = args.backup

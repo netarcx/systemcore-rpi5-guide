@@ -20,6 +20,7 @@ import tempfile
 import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -39,6 +40,9 @@ RES_CANBUSWATCHDOG = RESOURCES / "canbuswatchdog-override.conf"
 RES_ROBOT = RESOURCES / "robot-override.conf"
 RES_PICOFLASHER = RESOURCES / "picoflasher-override.conf"
 RES_MRCCAN = RESOURCES / "mrccan.conf"
+RES_MODULES_LOAD = RESOURCES / "modules-load.conf"
+RES_ALPHA2_PI5B_DTB = RESOURCES / "alpha2" / "bcm2712-rpi-5-b.dtb"
+RES_ALPHA2_PI5B_DTB_D0 = RESOURCES / "alpha2" / "bcm2712d0-rpi-5-b.dtb"
 
 # Project-relative defaults the user can override.
 DEFAULT_FLASH_PICO = PROJECT_ROOT / "netboot" / "flash-pico.sh"
@@ -50,6 +54,29 @@ DEFAULT_REGDB_DEB = (
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
+
+
+class ImageType(Enum):
+    """Upstream image families, distinguished by partition layout.
+
+    The A/B layout covers Beta 10 through the current 2027.0.0 betas *and*
+    Alpha 11+ — since Alpha 11 the alpha line ships the same partition table
+    as the beta line, so both are patched identically.  Only Alpha 2–10 use
+    the older single-boot-partition layout.
+    """
+
+    AB = "ab"           # boot selector + boot A/B + rootfs A/B
+    ALPHA = "alpha"     # 4 partitions: single boot + rootfs_a/b + data
+    UNKNOWN = "unknown"
+
+
+# Accepted --image-type values, including names of superseded releases.
+IMAGE_TYPE_ALIASES: dict[str, ImageType] = {
+    "ab": ImageType.AB,
+    "beta": ImageType.AB,
+    "beta10": ImageType.AB,   # what this type was called before Alpha 11
+    "alpha": ImageType.ALPHA,
+}
 
 
 class PatcherError(Exception):
@@ -80,10 +107,17 @@ class PatchOptions:
     flash_pico_path: Path = DEFAULT_FLASH_PICO
     regdb_deb_path: Path = DEFAULT_REGDB_DEB
 
-    # --- Boot partition patches ---
+    # --- Boot partition patches (shared) ---
     enable_hdmi: bool = True
     disable_spi_can: bool = True
     update_cmdline: bool = True
+
+    # --- Boot partition patches (legacy Alpha 2-10 only, skipped on A/B images) ---
+    fix_autoboot: bool = True
+    fix_config_sections: bool = True
+    fix_cmdline_reference: bool = True
+    install_pi5b_dtb: bool = True
+    comment_pi4_firmware: bool = True
 
     # --- Rootfs patches ---
     install_flash_pico: bool = True
@@ -92,11 +126,13 @@ class PatchOptions:
     install_canbuswatchdog: bool = True
     install_robot_override: bool = True
     install_mrccan: bool = True
+    install_modules_load: bool = True
     install_regdb: bool = True
     patch_dashboard_wlan: bool = True
     patch_dashboard_faults: bool = True
 
     # --- Operational flags ---
+    force_image_type: Optional[ImageType] = None
     dry_run: bool = False
     verbose: bool = False
     backup: bool = False
@@ -111,12 +147,18 @@ class PatchOptions:
             "enable_hdmi",
             "disable_spi_can",
             "update_cmdline",
+            "fix_autoboot",
+            "fix_config_sections",
+            "fix_cmdline_reference",
+            "install_pi5b_dtb",
+            "comment_pi4_firmware",
             "install_flash_pico",
             "install_can_udev",
             "install_canbusprocess",
             "install_canbuswatchdog",
             "install_robot_override",
             "install_mrccan",
+            "install_modules_load",
             "install_regdb",
             "patch_dashboard_wlan",
             "patch_dashboard_faults",
@@ -127,12 +169,18 @@ PATCH_DESCRIPTIONS: dict[str, str] = {
     "enable_hdmi": "Uncomment HDMI display options in config.txt",
     "disable_spi_can": "Comment out spi/sc-mcp2518 overlays (no SPI CAN on Pi 5B)",
     "update_cmdline": "Add panic=0 and cfg80211.ieee80211_regdom=US to cmdline.txt",
+    "fix_autoboot": "Disable autoboot.txt partition redirection (Alpha 2-10)",
+    "fix_config_sections": "Add [all] before global settings in config.txt (Alpha 2-10)",
+    "fix_cmdline_reference": "Create cmdline.txt from cmdline_a.txt (Alpha 2-10)",
+    "install_pi5b_dtb": "Install bcm2712-rpi-5-b.dtb for Pi 5 Model B (Alpha 2-10)",
+    "comment_pi4_firmware": "Comment out Pi 4 firmware references in config.txt (Alpha 2-10)",
     "install_flash_pico": "Install flash-pico.sh + picoflasherprocess override",
     "install_can_udev": "Install 90-usb-can-rename.rules (USB-only trigger)",
     "install_canbusprocess": "Install canbusprocess override with vcan placeholders",
     "install_canbuswatchdog": "Install canbuswatchdog override (waits for any can_s*)",
     "install_robot_override": "Install robot.service override (30s CAN wait, optional)",
     "install_mrccan": "Install /etc/tmpfiles.d/mrccan.conf (unblocks MrcCommDaemon)",
+    "install_modules_load": "Load robot_heartbeat + i2c-dev at boot (creates /dev/mrccan/*)",
     "install_regdb": "Install wireless-regdb so WiFi works on US regulatory domain",
     "patch_dashboard_wlan": "Unlock WLAN0 AP settings in the dashboard JS",
     "patch_dashboard_faults": "Add a 'Reset Fault Counts' button to the dashboard",
@@ -186,6 +234,7 @@ class Partition:
     start_bytes: int    # byte offset of partition start within the image
     size_bytes: int     # partition size in bytes
     fs: str             # detected filesystem ("vfat", "ext4", "extended", "unknown")
+    present: bool = True  # False when the partition extends past end-of-file
 
     @property
     def end_bytes(self) -> int:
@@ -198,23 +247,39 @@ class ImageLayout:
 
     image: Path
     partitions: list[Partition]
+    image_type: ImageType = ImageType.UNKNOWN
     boot_a: Optional[Partition] = None
     boot_b: Optional[Partition] = None
     root_a: Optional[Partition] = None
     root_b: Optional[Partition] = None
+    # True when the image is shipped "packed": the partition table declares a
+    # rootfs B that isn't in the file. /usr/local/bin/expandfs.sh grows the
+    # table and formats slot B on first boot (Beta 14 / Alpha 14 and later).
+    packed: bool = False
 
 
 def detect_layout(image: Path, log: logging.Logger) -> ImageLayout:
     """Detect partition offsets and identify the boot/root A/B partitions.
 
-    Beta 10 layout (boot selector + A/B kernel/rootfs) has 6 partitions; we
-    identify them by size and filesystem rather than by index so that the
-    patcher survives layout changes in future upstream releases.
+    A/B layout (Beta 10+, Alpha 11+): boot selector + boot A/B + extended +
+    rootfs A/B.  Two FAT32 boot partitions >= 30 MB.
+
+    Alpha layout (Alpha 2-10): single boot + rootfs_a/b + data.  One FAT32
+    boot partition, no separate boot A/B.
+
+    Since Beta 14 / Alpha 14 the images ship *packed*: rootfs A is shrunk to
+    its filesystem size and rootfs B is declared in the partition table but
+    lies past the end of the file (first boot runs expandfs.sh, which grows
+    both slots to 7 GiB and formats B).  Partitions that don't fit inside the
+    file are marked ``present=False`` and are never mounted.
+
+    Partitions are identified by size and filesystem rather than by index so
+    the patcher survives layout changes in future upstream releases.
     """
     log.info("Detecting partition layout of %s", image)
 
-    # sfdisk -d gives a stable, parseable dump of the partition table.
     dump = run_text(["sfdisk", "-d", str(image)], log)
+    image_size = image.stat().st_size
 
     partitions: list[Partition] = []
     line_re = re.compile(
@@ -227,38 +292,79 @@ def detect_layout(image: Path, log: logging.Logger) -> ImageLayout:
         start_sec, size_sec, ptype = m.groups()
         start = int(start_sec) * 512
         size = int(size_sec) * 512
-        fs = _detect_fs(image, start, ptype, log)
+        # A packed image declares partitions that aren't in the file yet;
+        # mounting one would fail, so record it and move on. The extended
+        # container legitimately spans the not-yet-created partitions, so it
+        # is judged by its start sector alone.
+        is_extended = ptype.lower() in ("5", "0x5", "f", "0xf")
+        present = start < image_size if is_extended else start + size <= image_size
+        fs = _detect_fs(image, start, ptype, log) if present else "absent"
+        if not present:
+            if start < image_size:
+                # The file ends *inside* this partition. A packed image starts
+                # its missing partitions cleanly past EOF, so this is a
+                # truncated or partially-copied file, not a packed one.
+                log.warning(
+                    "Partition %d (offset %d, %.1f MB) is cut off by the end of "
+                    "the file — the image looks truncated or incompletely "
+                    "downloaded. Skipping it; re-download if that's unexpected.",
+                    len(partitions) + 1, start, size / (1024 * 1024),
+                )
+            else:
+                log.info(
+                    "Partition %d (offset %d, %.1f MB) lies past end of file — "
+                    "not present in this image",
+                    len(partitions) + 1, start, size / (1024 * 1024),
+                )
         partitions.append(
-            Partition(index=len(partitions) + 1, start_bytes=start, size_bytes=size, fs=fs)
+            Partition(index=len(partitions) + 1, start_bytes=start,
+                      size_bytes=size, fs=fs, present=present)
         )
 
     if not partitions:
         raise PreflightError(f"sfdisk found no partitions in {image}")
 
-    # Identify by signature: there are exactly two ~64M FAT32 partitions
-    # (boot A/B) and two ~7G ext4 partitions (rootfs A/B).
-    fat_parts = [p for p in partitions if p.fs == "vfat" and p.size_bytes < 200 * 1024 * 1024]
-    ext_parts = [p for p in partitions if p.fs == "ext4"]
+    fat_parts = [p for p in partitions
+                 if p.present and p.fs == "vfat" and p.size_bytes < 200 * 1024 * 1024]
+    ext_parts = [p for p in partitions if p.present and p.fs == "ext4"]
 
-    # Sort by start offset so A always comes before B.
     fat_parts.sort(key=lambda p: p.start_bytes)
     ext_parts.sort(key=lambda p: p.start_bytes)
 
-    # The first FAT might be the small "boot selector" (16M). Drop anything
-    # smaller than 30M from the boot candidates so we only keep the two ~64M
-    # kernel boot partitions.
     boot_candidates = [p for p in fat_parts if p.size_bytes >= 30 * 1024 * 1024]
 
     layout = ImageLayout(image=image, partitions=partitions)
-    if len(boot_candidates) >= 1:
-        layout.boot_a = boot_candidates[0]
+
     if len(boot_candidates) >= 2:
+        layout.image_type = ImageType.AB
+        layout.boot_a = boot_candidates[0]
         layout.boot_b = boot_candidates[1]
+    elif len(boot_candidates) == 1:
+        layout.image_type = ImageType.ALPHA
+        layout.boot_a = boot_candidates[0]
+    else:
+        layout.image_type = ImageType.UNKNOWN
+
     if len(ext_parts) >= 1:
         layout.root_a = ext_parts[0]
     if len(ext_parts) >= 2:
         layout.root_b = ext_parts[1]
 
+    # A/B image with only one usable rootfs = packed image; slot B is created
+    # on first boot by expandfs.sh and there is nothing there to patch.
+    layout.packed = (
+        layout.image_type == ImageType.AB
+        and layout.root_a is not None
+        and layout.root_b is None
+    )
+    if layout.packed:
+        log.info(
+            "Packed image: rootfs B is not in the file (created on first boot "
+            "by expandfs.sh). Patching rootfs A only — an OTA update to slot B "
+            "overwrites it wholesale and would drop these patches anyway."
+        )
+
+    log.info("Detected image type: %s", layout.image_type.value)
     for label, part in [
         ("boot_a", layout.boot_a),
         ("boot_b", layout.boot_b),
@@ -275,16 +381,16 @@ def detect_layout(image: Path, log: logging.Logger) -> ImageLayout:
                 part.size_bytes / (1024 * 1024),
             )
         else:
-            log.warning("  %s -> NOT FOUND", label)
+            log.debug("  %s -> not present", label)
 
     return layout
 
 
 def _detect_fs(image: Path, offset: int, ptype: str, log: logging.Logger) -> str:
-    """Identify the filesystem at a given offset using `file -s` semantics.
+    """Identify the filesystem at a given offset by its superblock magic.
 
-    We dd a small slice to a temp file and run `file` on it — that's the
-    only way to identify FS type without setting up a loop device.
+    Reading the magic bytes directly avoids both a loop device and a
+    dependency on the `file` binary.
     """
     if ptype.lower() in ("5", "0x5", "f", "0xf"):
         # Extended partition container; no real filesystem.
@@ -451,6 +557,91 @@ def patch_boot_partition(mount: Path, opts: PatchOptions, log: logging.Logger,
                 cmdline.write_text(content + "\n")
 
 
+def patch_boot_alpha(mount: Path, opts: PatchOptions, log: logging.Logger,
+                     label: str) -> None:
+    """Apply legacy-Alpha boot fixes, then shared boot patches.
+
+    Alpha 2-10 images have a single boot partition with autoboot.txt that redirects
+    to an ext4 rootfs partition (unreadable by the Pi 5 bootloader), config.txt
+    conditional sections that hide ``kernel=Image`` from normal boot, and no
+    Pi 5 Model B device tree.
+    """
+    log.info("=== Patching boot partition %s (Alpha) ===", label)
+
+    config = mount / "config.txt"
+    autoboot = mount / "autoboot.txt"
+
+    if opts.fix_autoboot and autoboot.exists():
+        log.info("[%s] Disabling autoboot.txt partition redirection", label)
+        if not opts.dry_run:
+            autoboot.rename(mount / "autoboot.txt.disabled")
+
+    if opts.fix_config_sections and config.exists():
+        _fix_alpha_config_sections(config, log, opts.dry_run)
+
+    if opts.fix_cmdline_reference:
+        cmdline = mount / "cmdline.txt"
+        cmdline_a = mount / "cmdline_a.txt"
+        if not cmdline.exists() and cmdline_a.exists():
+            log.info("[%s] Creating cmdline.txt from cmdline_a.txt", label)
+            if not opts.dry_run:
+                shutil.copy2(cmdline_a, cmdline)
+
+    if opts.install_pi5b_dtb:
+        if RES_ALPHA2_PI5B_DTB.exists():
+            copy_into(RES_ALPHA2_PI5B_DTB, mount / "bcm2712-rpi-5-b.dtb",
+                      log, opts.dry_run)
+        else:
+            log.warning("[%s] Pi 5B DTB not found at %s", label, RES_ALPHA2_PI5B_DTB)
+        if RES_ALPHA2_PI5B_DTB_D0.exists():
+            copy_into(RES_ALPHA2_PI5B_DTB_D0, mount / "bcm2712d0-rpi-5-b.dtb",
+                      log, opts.dry_run)
+
+    if opts.comment_pi4_firmware and config.exists():
+        log.info("[%s] Commenting out Pi 4 firmware references", label)
+        sed_inplace(config, r"^(start_file=.*)$", r"#\1", log, opts.dry_run)
+        sed_inplace(config, r"^(fixup_file=.*)$", r"#\1", log, opts.dry_run)
+
+    patch_boot_partition(mount, opts, log, label)
+
+
+def _fix_alpha_config_sections(config: Path, log: logging.Logger,
+                               dry_run: bool) -> None:
+    """Insert ``[all]`` before global settings in Alpha config.txt.
+
+    Alpha config.txt has ``[boot_partition=2]`` and ``[boot_partition=3]``
+    sections at the top.  Everything after the last conditional — including
+    ``kernel=Image`` — is trapped inside that section and invisible when
+    booting from partition 1.  Inserting ``[all]`` lifts the global settings
+    out of the conditional block.
+    """
+    text = config.read_text(encoding="utf-8", errors="surrogateescape")
+    if "[all]" in text:
+        log.debug("config.txt already has [all] section")
+        return
+    patched, n = re.subn(
+        r"^(\[boot_partition=3\]\s*\n(?:cmdline=\S+\n))\n",
+        r"\1\n[all]\n",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if n == 0:
+        patched, n = re.subn(
+            r"^(kernel=Image)",
+            r"[all]\n\1",
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    if n == 0:
+        log.warning("Could not insert [all] — config.txt structure not recognized")
+        return
+    log.info("Inserted [all] section in config.txt")
+    if not dry_run:
+        config.write_text(patched, encoding="utf-8", errors="surrogateescape")
+
+
 # ---------------------------------------------------------------------------
 # Rootfs partition patches
 # ---------------------------------------------------------------------------
@@ -460,6 +651,7 @@ def patch_rootfs_partition(mount: Path, opts: PatchOptions, log: logging.Logger,
                            label: str) -> None:
     """Apply all enabled rootfs patches."""
     log.info("=== Patching rootfs %s ===", label)
+    log.info("[%s] Upstream release: %s", label, read_os_release(mount))
 
     if opts.install_flash_pico:
         if not opts.flash_pico_path.exists():
@@ -501,8 +693,16 @@ def patch_rootfs_partition(mount: Path, opts: PatchOptions, log: logging.Logger,
     if opts.install_mrccan:
         copy_into(RES_MRCCAN, mount / "etc/tmpfiles.d/mrccan.conf", log, opts.dry_run)
 
+    if opts.install_modules_load:
+        copy_into(RES_MODULES_LOAD,
+                  mount / "etc/modules-load.d/systemcore-pi5b.conf",
+                  log, opts.dry_run)
+
     if opts.install_regdb:
-        if not opts.regdb_deb_path.exists():
+        if (mount / "usr/lib/firmware/regulatory.db").exists():
+            log.info("[%s] regulatory.db already present upstream, skipping regdb install",
+                     label)
+        elif not opts.regdb_deb_path.exists():
             log.warning("[%s] wireless-regdb .deb not found at %s, skipping",
                         label, opts.regdb_deb_path)
         else:
@@ -510,6 +710,17 @@ def patch_rootfs_partition(mount: Path, opts: PatchOptions, log: logging.Logger,
 
     if opts.patch_dashboard_wlan or opts.patch_dashboard_faults:
         _patch_dashboard(mount, opts, log, label)
+
+
+def read_os_release(mount: Path) -> str:
+    """Return PRETTY_NAME from a mounted rootfs, or "unknown"."""
+    os_release = mount / "etc/os-release"
+    if not os_release.exists():
+        return "unknown"
+    for line in os_release.read_text(errors="replace").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            return line.split("=", 1)[1].strip().strip('"')
+    return "unknown"
 
 
 def _install_regdb(mount: Path, deb: Path, log: logging.Logger,
@@ -557,20 +768,57 @@ def _patch_dashboard(mount: Path, opts: PatchOptions, log: logging.Logger,
             log,
             opts.dry_run,
         )
-        # Inject the reset button next to the historical fault list.
-        sed_inplace(
-            js,
-            r'"historical-"\.concat\(t\)\)\}\)\)\]',
-            '"historical-".concat(t))})),'
-            '(0,xo.jsx)("div",{style:{marginTop:"8px",textAlign:"center"},'
-            'children:(0,xo.jsx)("button",{onClick:function(){'
-            'window.__faultBL=window.__rawFC?window.__rawFC.slice():[]},'
-            'style:{fontSize:"11px",padding:"2px 8px",cursor:"pointer",'
-            'background:"#333",color:"#fff",border:"1px solid #666",'
-            'borderRadius:"3px"},children:"Reset Fault Counts"})})]',
-            log,
-            opts.dry_run,
-        )
+        _inject_fault_reset_button(js, log, opts.dry_run, label)
+
+
+# Marker used to make the fault-button injection idempotent.
+FAULT_RESET_MARKER = "window.__faultBL=window.__rawFC"
+
+# End of the historical fault list — the `]` closes the tooltip's children
+# array, which is where the button gets appended.
+FAULT_LIST_TAIL_RE = r'"historical-"\.concat\(t\)\)\}\)\)\]'
+
+# The bundler minifies the react/jsx-runtime import to a different name in
+# every build ("xo" in Beta 10, "bo" in Beta 14), so the alias has to be read
+# out of the surrounding code rather than hardcoded — the injected markup
+# throws a ReferenceError and blanks the dashboard if it names the wrong one.
+JSX_ALIAS_RE = r"\(0,(\w+)\.jsx\)"
+
+
+def _inject_fault_reset_button(js: Path, log: logging.Logger, dry_run: bool,
+                               label: str) -> None:
+    """Append a "Reset Fault Counts" button to the dashboard fault tooltip."""
+    text = js.read_text(encoding="utf-8", errors="surrogateescape")
+    if FAULT_RESET_MARKER in text:
+        log.info("[%s] Fault reset button already present, skipping", label)
+        return
+
+    m = re.search(FAULT_LIST_TAIL_RE, text)
+    if not m:
+        log.warning("[%s] Fault history list not found in %s — dashboard layout "
+                    "changed upstream; skipping fault reset button", label, js.name)
+        return
+
+    # The nearest jsx() call before the list is the one rendering it.
+    aliases = re.findall(JSX_ALIAS_RE, text[max(0, m.start() - 500):m.start()])
+    if not aliases:
+        log.warning("[%s] Could not determine the jsx alias near the fault list; "
+                    "skipping fault reset button", label)
+        return
+    jsx = aliases[-1]
+    button = (
+        f'"historical-".concat(t))}})),'
+        f'(0,{jsx}.jsx)("div",{{style:{{marginTop:"8px",textAlign:"center"}},'
+        f'children:(0,{jsx}.jsx)("button",{{onClick:function(){{'
+        f'{FAULT_RESET_MARKER}?window.__rawFC.slice():[]}},'
+        f'style:{{fontSize:"11px",padding:"2px 8px",cursor:"pointer",'
+        f'background:"#333",color:"#fff",border:"1px solid #666",'
+        f'borderRadius:"3px"}},children:"Reset Fault Counts"}})}})]'
+    )
+    patched = text[:m.start()] + button + text[m.end():]
+    log.info("[%s] Injecting fault reset button (jsx alias: %s)", label, jsx)
+    if not dry_run:
+        js.write_text(patched, encoding="utf-8", errors="surrogateescape")
 
 
 # ---------------------------------------------------------------------------
@@ -585,14 +833,28 @@ def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
     """
     log.info("=== Validating patched image ===")
     problems: list[str] = []
+    checked: list[str] = []
     tracker = MountTracker()
     try:
+        if layout.image_type == ImageType.ALPHA and layout.boot_a:
+            with mount_partition(layout.image, layout.boot_a, log, tracker) as mnt:
+                for name in ("bcm2712-rpi-5-b.dtb", "cmdline.txt", "Image"):
+                    if not (mnt / name).exists():
+                        problems.append(f"[boot] missing: {name}")
+                config = mnt / "config.txt"
+                if config.exists() and "[all]" not in config.read_text():
+                    problems.append("[boot] config.txt missing [all] section")
+                autoboot = mnt / "autoboot.txt"
+                if autoboot.exists():
+                    problems.append("[boot] autoboot.txt should be disabled")
         for label, part in [("rootfs_a", layout.root_a), ("rootfs_b", layout.root_b)]:
             if part is None:
                 continue
+            checked.append(label)
             with mount_partition(layout.image, part, log, tracker) as mnt:
                 expected = [
                     "etc/tmpfiles.d/mrccan.conf",
+                    "etc/modules-load.d/systemcore-pi5b.conf",
                     "etc/udev/rules.d/90-usb-can-rename.rules",
                     "etc/systemd/system/limelight_canbusprocess.service.d/override.conf",
                     "etc/systemd/system/robot.service.d/override.conf",
@@ -607,7 +869,8 @@ def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
     finally:
         tracker.cleanup(log)
     if not problems:
-        log.info("Validation passed: all expected files present in rootfs A/B")
+        log.info("Validation passed: all expected files present in %s",
+                 " + ".join(checked) if checked else "no rootfs (nothing to check)")
     else:
         for p in problems:
             log.error(p)
@@ -648,9 +911,21 @@ def preflight(opts: PatchOptions, log: logging.Logger) -> None:
     if os.geteuid() != 0:
         raise PreflightError("Must run as root (sudo) — mount and dpkg-deb need root.")
 
-    for cmd in ("sfdisk", "mount", "umount", "dpkg-deb", "file"):
+    for cmd in ("sfdisk", "mount", "umount"):
         if not shutil.which(cmd):
             raise PreflightError(f"Required command not found: {cmd}")
+
+    # dpkg-deb is only used to unpack the wireless-regdb .deb, and that patch
+    # is skipped outright on images that already ship regulatory.db (Beta 14+),
+    # so it isn't a hard requirement unless that .deb is actually going to be
+    # used. Filesystem detection reads magic bytes directly, so `file` — which
+    # older versions of this check demanded — isn't needed at all.
+    if opts.install_regdb and opts.regdb_deb_path.exists():
+        if not shutil.which("dpkg-deb"):
+            raise PreflightError(
+                "Required command not found: dpkg-deb (needed to install "
+                f"{opts.regdb_deb_path.name}; pass --no-install-regdb to skip)"
+            )
 
     if not opts.input_image.exists():
         raise PreflightError(f"Input image not found: {opts.input_image}")
@@ -718,14 +993,23 @@ def patch_image(opts: PatchOptions, log: logging.Logger,
 
     layout = detect_layout(working if not opts.dry_run else opts.input_image, log)
 
+    if opts.force_image_type is not None:
+        log.info("Overriding detected type %s -> %s",
+                 layout.image_type.value, opts.force_image_type.value)
+        layout.image_type = opts.force_image_type
+
     # Stage 2: patch each partition.
     tracker = MountTracker()
+    boot_fn: Callable[[Path, PatchOptions, logging.Logger, str], None] = (
+        patch_boot_alpha if layout.image_type == ImageType.ALPHA
+        else patch_boot_partition
+    )
     try:
         steps: list[tuple[str, Partition, Callable[[Path, PatchOptions, logging.Logger, str], None]]] = []
         if layout.boot_a:
-            steps.append(("boot_a", layout.boot_a, patch_boot_partition))
+            steps.append(("boot_a", layout.boot_a, boot_fn))
         if layout.boot_b and not opts.skip_b_partitions:
-            steps.append(("boot_b", layout.boot_b, patch_boot_partition))
+            steps.append(("boot_b", layout.boot_b, boot_fn))
         if layout.root_a:
             steps.append(("rootfs_a", layout.root_a, patch_rootfs_partition))
         if layout.root_b and not opts.skip_b_partitions:

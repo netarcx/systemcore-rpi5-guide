@@ -1,9 +1,13 @@
 # Large binary files (not tracked in git)
 *.img
+*.img.xz
 *.zip
 *.deb
 *.tar.gz
 *.tar.xz
+
+# Upstream kernel source tree (multi-GB, fetched on demand)
+rpi-linux/
 
 # Build output
 output/
