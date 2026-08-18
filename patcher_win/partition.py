@@ -18,6 +18,7 @@ class Partition:
     start_bytes: int
     size_bytes: int
     fs: str
+    present: bool = True  # False when the partition extends past end-of-file
 
     @property
     def end_bytes(self) -> int:
@@ -32,6 +33,10 @@ class ImageLayout:
     boot_b: Optional[Partition] = None
     root_a: Optional[Partition] = None
     root_b: Optional[Partition] = None
+    # True when the partition table declares a rootfs B that isn't in the
+    # file. Beta 14 / Alpha 14 and later ship packed like this; expandfs.sh
+    # grows the table and formats slot B on first boot.
+    packed: bool = False
 
 
 MBR_ENTRY_FORMAT = "<B3xB3xII"  # status, type, lba_start, lba_sectors
@@ -60,6 +65,9 @@ def _detect_fs_from_bytes(image_path: Path, offset: int, ptype: int) -> str:
     if ptype in (0x05, 0x0F, 0x85):
         return "extended"
 
+    if offset >= image_path.stat().st_size:
+        return "absent"
+
     with open(image_path, "rb") as f:
         f.seek(offset)
         head = f.read(8192)
@@ -75,6 +83,7 @@ def _detect_fs_from_bytes(image_path: Path, offset: int, ptype: int) -> str:
 
 def detect_layout(image: Path) -> ImageLayout:
     """Parse MBR (and extended partitions) to build the full partition list."""
+    image_size = image.stat().st_size
     with open(image, "rb") as f:
         mbr = f.read(512)
 
@@ -105,6 +114,7 @@ def detect_layout(image: Path) -> ImageLayout:
                     start_bytes=logical_start,
                     size_bytes=logical_size,
                     fs=fs,
+                    present=logical_start + logical_size <= image_size,
                 ))
                 # Second entry (if present) points to next EBR (relative to extended start)
                 if len(sub_entries) < 2:
@@ -123,15 +133,17 @@ def detect_layout(image: Path) -> ImageLayout:
                 start_bytes=start,
                 size_bytes=size,
                 fs=fs,
+                present=start + size <= image_size,
             ))
 
     # Identify boot A/B and rootfs A/B by size + type (same heuristic as Linux version)
     fat_parts = sorted(
-        [p for p in partitions if p.fs == "vfat" and p.size_bytes < 200 * 1024 * 1024],
+        [p for p in partitions
+         if p.present and p.fs == "vfat" and p.size_bytes < 200 * 1024 * 1024],
         key=lambda p: p.start_bytes,
     )
     ext_parts = sorted(
-        [p for p in partitions if p.fs == "ext4"],
+        [p for p in partitions if p.present and p.fs == "ext4"],
         key=lambda p: p.start_bytes,
     )
     boot_candidates = [p for p in fat_parts if p.size_bytes >= 30 * 1024 * 1024]
@@ -145,5 +157,11 @@ def detect_layout(image: Path) -> ImageLayout:
         layout.root_a = ext_parts[0]
     if len(ext_parts) >= 2:
         layout.root_b = ext_parts[1]
+
+    layout.packed = (
+        layout.boot_b is not None
+        and layout.root_a is not None
+        and layout.root_b is None
+    )
 
     return layout

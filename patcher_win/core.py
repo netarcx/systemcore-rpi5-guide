@@ -38,6 +38,7 @@ RES_CANBUSWATCHDOG = RESOURCES / "canbuswatchdog-override.conf"
 RES_ROBOT = RESOURCES / "robot-override.conf"
 RES_PICOFLASHER = RESOURCES / "picoflasher-override.conf"
 RES_MRCCAN = RESOURCES / "mrccan.conf"
+RES_MODULES_LOAD = RESOURCES / "modules-load.conf"
 
 DEFAULT_FLASH_PICO = PROJECT_ROOT / "netboot" / "flash-pico.sh"
 DEFAULT_REGDB_DEB = (
@@ -82,6 +83,7 @@ class PatchOptions:
     install_canbuswatchdog: bool = True
     install_robot_override: bool = True
     install_mrccan: bool = True
+    install_modules_load: bool = True
     install_regdb: bool = True
     patch_dashboard_wlan: bool = True
     patch_dashboard_faults: bool = True
@@ -98,7 +100,8 @@ class PatchOptions:
             "enable_hdmi", "disable_spi_can", "update_cmdline",
             "install_flash_pico", "install_can_udev",
             "install_canbusprocess", "install_canbuswatchdog",
-            "install_robot_override", "install_mrccan", "install_regdb",
+            "install_robot_override", "install_mrccan", "install_modules_load",
+            "install_regdb",
             "patch_dashboard_wlan", "patch_dashboard_faults",
         ]
 
@@ -113,6 +116,7 @@ PATCH_DESCRIPTIONS: dict[str, str] = {
     "install_canbuswatchdog": "Install canbuswatchdog override (waits for any can_s*)",
     "install_robot_override": "Install robot.service override (30s CAN wait, optional)",
     "install_mrccan": "Install /etc/tmpfiles.d/mrccan.conf (unblocks MrcCommDaemon)",
+    "install_modules_load": "Load robot_heartbeat + i2c-dev at boot (creates /dev/mrccan/*)",
     "install_regdb": "Install wireless-regdb so WiFi works on US regulatory domain",
     "patch_dashboard_wlan": "Unlock WLAN0 AP settings in the dashboard JS",
     "patch_dashboard_faults": "Add a 'Reset Fault Counts' button to the dashboard",
@@ -237,8 +241,17 @@ def patch_rootfs_partition(ext4: Ext4Partition, opts: PatchOptions,
         if not opts.dry_run:
             ext4.copy_file_in(RES_MRCCAN, "/etc/tmpfiles.d/mrccan.conf")
 
+    if opts.install_modules_load:
+        log.info("[%s] Installing modules-load.d config", label)
+        if not opts.dry_run:
+            ext4.copy_file_in(RES_MODULES_LOAD,
+                              "/etc/modules-load.d/systemcore-pi5b.conf")
+
     if opts.install_regdb:
-        if not opts.regdb_deb_path.exists():
+        if ext4.exists("/usr/lib/firmware/regulatory.db"):
+            log.info("[%s] regulatory.db already present upstream, skipping regdb install",
+                     label)
+        elif not opts.regdb_deb_path.exists():
             log.warning("[%s] wireless-regdb .deb not found at %s, skipping",
                         label, opts.regdb_deb_path)
         else:
@@ -304,20 +317,57 @@ def _patch_dashboard(ext4: Ext4Partition, opts: PatchOptions,
             "return Math.max(0,v-((window.__faultBL||[])[j]||0))})",
             log,
         )
-        content, _ = _sed(
-            content,
-            r'"historical-"\.concat\(t\)\)\}\)\)\]',
-            '"historical-".concat(t))})),'
-            '(0,xo.jsx)("div",{style:{marginTop:"8px",textAlign:"center"},'
-            'children:(0,xo.jsx)("button",{onClick:function(){'
-            'window.__faultBL=window.__rawFC?window.__rawFC.slice():[]},'
-            'style:{fontSize:"11px",padding:"2px 8px",cursor:"pointer",'
-            'background:"#333",color:"#fff",border:"1px solid #666",'
-            'borderRadius:"3px"},children:"Reset Fault Counts"})})]',
-            log,
-        )
+        content = _inject_fault_reset_button(content, log, label)
 
     ext4.write_text(js_path, content)
+
+
+# Marker used to make the fault-button injection idempotent.
+FAULT_RESET_MARKER = "window.__faultBL=window.__rawFC"
+
+# End of the historical fault list — the `]` closes the tooltip's children
+# array, which is where the button gets appended.
+FAULT_LIST_TAIL_RE = r'"historical-"\.concat\(t\)\)\}\)\)\]'
+
+# The bundler minifies the react/jsx-runtime import to a different name in
+# every build ("xo" in Beta 10, "bo" in Beta 14), so the alias has to be read
+# out of the surrounding code rather than hardcoded — the injected markup
+# throws a ReferenceError and blanks the dashboard if it names the wrong one.
+JSX_ALIAS_RE = r"\(0,(\w+)\.jsx\)"
+
+
+def _inject_fault_reset_button(content: str, log: logging.Logger,
+                               label: str) -> str:
+    """Append a "Reset Fault Counts" button to the dashboard fault tooltip."""
+    if FAULT_RESET_MARKER in content:
+        log.info("[%s] Fault reset button already present, skipping", label)
+        return content
+
+    m = re.search(FAULT_LIST_TAIL_RE, content)
+    if not m:
+        log.warning("[%s] Fault history list not found — dashboard layout changed "
+                    "upstream; skipping fault reset button", label)
+        return content
+
+    # The nearest jsx() call before the list is the one rendering it.
+    aliases = re.findall(JSX_ALIAS_RE, content[max(0, m.start() - 500):m.start()])
+    if not aliases:
+        log.warning("[%s] Could not determine the jsx alias near the fault list; "
+                    "skipping fault reset button", label)
+        return content
+
+    jsx = aliases[-1]
+    button = (
+        f'"historical-".concat(t))}})),'
+        f'(0,{jsx}.jsx)("div",{{style:{{marginTop:"8px",textAlign:"center"}},'
+        f'children:(0,{jsx}.jsx)("button",{{onClick:function(){{'
+        f'{FAULT_RESET_MARKER}?window.__rawFC.slice():[]}},'
+        f'style:{{fontSize:"11px",padding:"2px 8px",cursor:"pointer",'
+        f'background:"#333",color:"#fff",border:"1px solid #666",'
+        f'borderRadius:"3px"}},children:"Reset Fault Counts"}})}})]'
+    )
+    log.info("[%s] Injecting fault reset button (jsx alias: %s)", label, jsx)
+    return content[:m.start()] + button + content[m.end():]
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +386,7 @@ def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
         with Ext4Partition(layout.image, part.start_bytes, part.size_bytes) as ext4:
             expected = [
                 "/etc/tmpfiles.d/mrccan.conf",
+                "/etc/modules-load.d/systemcore-pi5b.conf",
                 "/etc/udev/rules.d/90-usb-can-rename.rules",
                 "/etc/systemd/system/limelight_canbusprocess.service.d/override.conf",
                 "/etc/systemd/system/robot.service.d/override.conf",
@@ -435,6 +486,24 @@ def patch_image(opts: PatchOptions, log: logging.Logger,
             log.info("  %s: partition %d, %s, offset=%d, size=%.1f MB",
                      label, part.index, part.fs, part.start_bytes,
                      part.size_bytes / (1024 * 1024))
+    image_size = target.stat().st_size  # `working` doesn't exist in dry-run
+    for part in layout.partitions:
+        if part.present:
+            continue
+        if part.start_bytes < image_size:
+            # The file ends inside this partition: truncated download, not a
+            # packed image (a packed image's missing partitions start past EOF).
+            log.warning("  partition %d (offset %d, %.1f MB) is cut off by the end "
+                        "of the file — the image looks truncated or incompletely "
+                        "downloaded. Skipping it; re-download if that's unexpected.",
+                        part.index, part.start_bytes, part.size_bytes / (1024 * 1024))
+        else:
+            log.info("  partition %d (offset %d, %.1f MB) lies past end of file — "
+                     "not present in this image",
+                     part.index, part.start_bytes, part.size_bytes / (1024 * 1024))
+    if layout.packed:
+        log.info("Packed image: rootfs B is not in the file (created on first boot "
+                 "by expandfs.sh). Patching rootfs A only.")
 
     # Patch boot partitions (FAT32)
     boot_parts = [("boot_a", layout.boot_a)]

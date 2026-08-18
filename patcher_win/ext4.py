@@ -11,8 +11,10 @@ import os
 import shutil
 import subprocess
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
+
+S_IFREG = 0o100000  # regular-file bits of i_mode
 
 log = logging.getLogger("patcher")
 
@@ -136,9 +138,13 @@ class Ext4Partition:
 
         # Remove existing file first (debugfs 'write' fails if file exists)
         self._run_debugfs([f"rm {guest_path}"], write=True)
+        # i_mode holds the file type in its high bits, so the permission bits
+        # have to be OR'd with S_IFREG. Setting a bare 0644 leaves a typeless
+        # inode: e2fsck reports "invalid mode" / "incorrect filetype" and the
+        # kernel refuses to read the directory it lives in.
         self._run_debugfs([
             f"write {local_tmp} {guest_path}",
-            f"set_inode_field {guest_path} mode 0{mode:o}",
+            f"set_inode_field {guest_path} mode 0{S_IFREG | mode:o}",
         ], write=True)
 
         local_tmp.unlink()
@@ -155,14 +161,22 @@ class Ext4Partition:
 
     def _mkdir_p(self, guest_path: str) -> None:
         """Create directory and all parents (like mkdir -p)."""
-        parts = Path(guest_path).parts
+        # PurePosixPath("/etc/foo").parts starts with "/" — passing that root
+        # component to debugfs runs `mkdir /`, which adds an entry with an
+        # empty name to the root directory ("Entry '' in / has a zero-length
+        # name") and makes the mounted filesystem throw EIO on readdir.
+        parts = [p for p in PurePosixPath(guest_path).parts if p != "/"]
         for i in range(1, len(parts) + 1):
-            partial = "/".join(parts[:i])
-            if not partial.startswith("/"):
-                partial = "/" + partial
-            # debugfs mkdir on existing dir is a no-op warning, not fatal
+            partial = "/" + "/".join(parts[:i])
+            # `mkdir` on a path that already exists still allocates an inode
+            # before failing to link it, leaving an unconnected directory
+            # behind (e2fsck: "Unconnected directory inode ... was in ...").
+            # Every parent of a file we install already exists, so this guard
+            # is the common case, not the exception.
+            if self.exists(partial):
+                continue
             self._run_debugfs([f"mkdir {partial}"], write=True)
-        self._modified = True
+            self._modified = True
 
     def exists(self, guest_path: str) -> bool:
         """Check if a path exists in the ext4 partition."""

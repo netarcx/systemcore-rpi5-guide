@@ -52,6 +52,7 @@ class PatcherGUI:
         ("install_canbuswatchdog", "canbuswatchdog override"),
         ("install_robot_override", "robot.service override"),
         ("install_mrccan", "/dev/mrccan tmpfile (MrcCommDaemon fix)"),
+        ("install_modules_load", "Load robot_heartbeat + i2c-dev at boot"),
         ("install_regdb", "Wireless regulatory database"),
         ("patch_dashboard_wlan", "Dashboard: unlock WLAN0 AP"),
         ("patch_dashboard_faults", "Dashboard: fault count reset button"),
@@ -124,7 +125,7 @@ class PatcherGUI:
         patches.columnconfigure(0, weight=1)
         patches.columnconfigure(1, weight=1)
         self._patch_column(patches, 0, "Boot partitions (A + B)", self.BOOT_PATCHES)
-        self._patch_column(patches, 1, "Rootfs (A + B)", self.ROOTFS_PATCHES)
+        self._patch_column(patches, 1, "Rootfs (every slot present)", self.ROOTFS_PATCHES)
 
         # Advanced options
         adv = ttk.LabelFrame(self.root, text="Options", padding=8)
