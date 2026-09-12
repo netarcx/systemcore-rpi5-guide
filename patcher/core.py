@@ -43,6 +43,12 @@ RES_ROBOT = RESOURCES / "robot-override.conf"
 RES_PICOFLASHER = RESOURCES / "picoflasher-override.conf"
 RES_MRCCAN = RESOURCES / "mrccan.conf"
 RES_MODULES_LOAD = RESOURCES / "modules-load.conf"
+RES_CAMERA_SHIM_SO = RESOURCES / "camera-shim" / "pi5b-camera-shim.so"
+RES_CAMERA_SHIM_CONF = RESOURCES / "camera-shim" / "visionserver-camera-shim.conf"
+
+# The four vision server instances that get the camera-shim drop-in.
+VISIONSERVER_UNITS = ("limelight_visionserver", "limelight_visionserver1",
+                      "limelight_visionserver2", "limelight_visionserver3")
 RES_ALPHA2_PI5B_DTB = RESOURCES / "alpha2" / "bcm2712-rpi-5-b.dtb"
 RES_ALPHA2_PI5B_DTB_D0 = RESOURCES / "alpha2" / "bcm2712d0-rpi-5-b.dtb"
 
@@ -129,6 +135,7 @@ class PatchOptions:
     install_robot_override: bool = True
     install_mrccan: bool = True
     install_modules_load: bool = True
+    install_camera_shim: bool = True
     install_regdb: bool = True
     patch_dashboard_wlan: bool = True
     patch_dashboard_faults: bool = True
@@ -161,6 +168,7 @@ class PatchOptions:
             "install_robot_override",
             "install_mrccan",
             "install_modules_load",
+            "install_camera_shim",
             "install_regdb",
             "patch_dashboard_wlan",
             "patch_dashboard_faults",
@@ -183,6 +191,7 @@ PATCH_DESCRIPTIONS: dict[str, str] = {
     "install_robot_override": "Install robot.service override (30s wait for can_s0..s4)",
     "install_mrccan": "Install /etc/tmpfiles.d/mrccan.conf (MrcCommDaemon fallback)",
     "install_modules_load": "Load i2c-dev at boot (robot_heartbeat comes from canbusprocess)",
+    "install_camera_shim": "Let vision servers use a camera plugged straight into a Pi 5B port",
     "install_regdb": "Install wireless-regdb so WiFi works on US regulatory domain",
     "patch_dashboard_wlan": "Unlock WLAN0 AP settings in the dashboard JS",
     "patch_dashboard_faults": "Add a 'Reset Fault Counts' button to the dashboard",
@@ -700,6 +709,17 @@ def patch_rootfs_partition(mount: Path, opts: PatchOptions, log: logging.Logger,
                   mount / "etc/modules-load.d/systemcore-pi5b.conf",
                   log, opts.dry_run)
 
+    if opts.install_camera_shim:
+        # LD_PRELOAD wrapper around realpath() so the vision servers accept a
+        # camera on a bare Pi 5B port (they only match the carrier board's
+        # hub path). One drop-in per vision server instance.
+        copy_into(RES_CAMERA_SHIM_SO, mount / "usr/local/lib/pi5b-camera-shim.so",
+                  log, opts.dry_run, mode=0o644)
+        for unit in VISIONSERVER_UNITS:
+            copy_into(RES_CAMERA_SHIM_CONF,
+                      mount / f"etc/systemd/system/{unit}.service.d/20-pi5b-camera.conf",
+                      log, opts.dry_run)
+
     if opts.install_regdb:
         if (mount / "usr/lib/firmware/regulatory.db").exists():
             log.info("[%s] regulatory.db already present upstream, skipping regdb install",
@@ -806,6 +826,9 @@ def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
                 expected = [
                     "etc/tmpfiles.d/mrccan.conf",
                     "etc/modules-load.d/systemcore-pi5b.conf",
+                    "usr/local/lib/pi5b-camera-shim.so",
+                    "etc/systemd/system/limelight_visionserver.service.d/20-pi5b-camera.conf",
+                    "etc/systemd/system/limelight_visionserver3.service.d/20-pi5b-camera.conf",
                     "etc/udev/rules.d/90-usb-can-rename.rules",
                     "etc/systemd/system/limelight_canbusprocess.service.d/override.conf",
                     "etc/systemd/system/robot.service.d/override.conf",

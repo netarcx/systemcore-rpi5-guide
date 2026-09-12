@@ -45,7 +45,7 @@ Consequences for the patcher:
 ```bash
 # Build from scratch (downloads the pinned upstream release, then patches it)
 sudo ./build-image.sh
-sudo dd if=systemcore-pi5b-2027.0.0-beta14-v3.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v4.img of=/dev/sdX bs=4M status=progress
 
 # Any upstream image (Alpha or Beta, auto-detected)
 sudo python3 patch-image.py upstream.img
@@ -63,6 +63,7 @@ patcher/              - Python package backing patch-image.py
   gui.py              - Tkinter GUI with live log streaming + per-patch toggles
   cli.py              - argparse, --dry-run / --inspect / --validate / --only
   resources/          - Drop-in service overrides + udev rules + tmpfile/modules-load configs
+    camera-shim/      - realpath() LD_PRELOAD shim (+ source, build.sh) that lets vision servers see a camera on a bare Pi 5B port
     alpha2/           - Pi 5B DTBs compiled from Alpha 2 kernel (6.6.45)
 netboot/
   flash-pico.sh       - Pico flasher replacement (installed into image by build-image.sh)
@@ -100,6 +101,7 @@ Not tracked in git: `cache/`, `*.img`, `*.zip`, `netboot/tftpboot/`, `netboot/nf
 11. **Wireless regdb** — regulatory.db installed for US WiFi channel support. Skipped when the image already ships `/usr/lib/firmware/regulatory.db` (true since Beta 14).
 12. **WLAN0 AP settings unlocked** — dashboard JS patched to allow modifying Access Point config
 13. **Fault count reset button** — frontend-only baseline reset added to fault tooltip in dashboard
+14. **Camera shim** — `LD_PRELOAD` wrapper around `realpath()` for the four vision servers so a camera plugged straight into a Pi 5B port is accepted (see the USB cameras section)
 
 ## Legacy-Alpha patches (auto-applied only for the Alpha 2–10 layout)
 
@@ -198,49 +200,50 @@ carries `bcm2712-rpi-5-b.dtb`, an `[all]` config.txt section, and a real `cmdlin
   the project targets plain USB-CAN adapters. The image installs add-on packages with `opkg`
   (`/var/lib/opkg/status`, dashboard `/api/packages/*` on port 4803).
 
-## USB cameras require a USB hub (confirmed on hardware)
+## USB cameras on a bare Pi 5B (fixed by the camera shim, confirmed on hardware)
 
-A USB camera plugged **directly** into a Pi 5B is found by the kernel (`uvcvideo` loads,
-`/dev/video0` appears, `lsusb` lists it) but never shows up on the dashboard's camera page.
-Every vision server logs:
-
-```
-Camera initialization failed (no camera on this port)
-```
-
-Each `visionserverN` canonicalises the camera's sysfs path and compares it against one
-hardcoded path that includes the **carrier board's internal 4-port USB hub**:
+Each `visionserverN` canonicalises `/sys/class/video4linux/videoN/device` with `realpath()`
+(imported as `__realpath_chk` — the binaries are fortified) and compares the result against
+one hard-coded path that includes the **carrier board's internal 4-port USB hub**:
 
 ```
 camera plugged straight in : .../xhci-hcd.1/usb3/3-1/3-1:1.0          (84 bytes)
 what visionserver expects  : .../xhci-hcd.1/usb3/3-1/3-1.1/3-1.1:1.0  (92 bytes)
 ```
 
-Everything up to `usb3/3-1/` already matches — the Pi 5B exposes the same controllers as the
-CM5. The only thing missing is the hub level.
+Without help every server logs `Camera initialization failed (no camera on this port)`
+even though the kernel is happy (`uvcvideo` loaded, `/dev/video0` present).
 
-**Fix: plug a USB hub into the USB 2.0 port that enumerates as `3-1`, camera into the hub.**
-The path becomes `3-1.1/3-1.1:1.0`, which matches the stock binary exactly — no patching, and
-it survives upstream updates. It must be a USB 2.0 (black) port; the blue USB 3.0 ports are on
-`xhci-hcd.0` (buses 1/2) and can never produce a `3-x` path.
+**Fix (patch 14):** `patcher/resources/camera-shim/pi5b-camera-shim.so`, loaded into the
+four vision servers via `LD_PRELOAD` (drop-in `20-pi5b-camera.conf`), wraps `realpath` /
+`__realpath_chk` / `canonicalize_file_name` and presents a camera that sits directly on a
+root port under the hub path the binaries expect. Nothing else is rewritten — strace shows
+the servers never open anything under the canonical path. Cameras already behind a hub
+(`3-1.2/3-1.2:1.0`) pass through untouched, so the hub setup keeps working. Verified on
+hardware: a UVC camera on the black port `3-1` is picked up as
+`found camera at .../3-1/3-1.1/3-1.1:1.0` → `USB camera generic-UVC ... locked to
+1280x720@30 MJPG`. The shim logs one line, `pi5b-camera-shim: presenting <real> as <fake>`,
+in each server's journal.
 
-Port ownership per instance (`usb_id` in `/usr/local/bin/visionserverN/global.settings`, also
-settable via the dashboard's `set_usb_id` API):
+Physical port → virtual hub port → which instance claims it (`usb_id` lives in
+`/usr/local/bin/visionserverN/global.settings`, settable via the dashboard `set_usb_id` API;
+all four ship with `usb_id: 0`, so they all target `3-1.1` and the first to claim it wins —
+the others log "no camera on this port", which is expected):
 
-| instance | `usb_id: 0` | `usb_id: 1` |
-| --- | --- | --- |
-| `visionserver` | `3-1.1` | — |
-| `visionserver1` | `3-1.1` | `3-1.2` |
-| `visionserver2` | `3-1.1` | `3-1.3` |
-| `visionserver3` | `3-1.1` | `3-1.4` |
+| Pi 5B port | presented as | `usb_id: 0` (any server) | `usb_id: 1` |
+| --- | --- | --- | --- |
+| `3-1` USB 2.0 (black) | `3-1.1` | yes | — |
+| `3-2` USB 2.0 (black) | `3-1.2` | — | `visionserver1` |
+| `1-1` / `2-1` USB 3.0 (blue) | `3-1.3` | — | `visionserver2` |
+| `1-2` / `2-2` USB 3.0 (blue) | `3-1.4` | — | `visionserver3` |
 
-All four ship with `usb_id: 0`, so they all target `3-1.1` and only the first to claim it wins —
-the others keep logging "no camera on this port", which is expected, not a fault. For a second
-camera, use hub port 2 and set that instance's `usb_id` to 1.
+Override the table with `Environment=PI5B_CAMERA_PORTS=3-1=1,1-1=3,...` in the drop-in.
+Rebuild the `.so` with `patcher/resources/camera-shim/build.sh <toolchain dir>` (the
+SystemCore release toolchain; Ubuntu's `gcc-aarch64-linux-gnu` also works).
 
 Do **not** try to fix this by patching the path string in the binary: it was tested, and the
-comparison length is baked in, so the shorter Pi 5B path plus NUL padding still fails to match.
-Making that work would mean rewriting the length immediate in the instruction stream.
+comparison length is baked in, so the shorter Pi 5B path plus NUL padding still fails to
+match. Making that work would mean rewriting the length immediate in the instruction stream.
 
 A camera that isn't in Limelight's database comes up as `generic-UVC` (logged as
 `USB camera generic-UVC (...): locked to 1280x720@30 MJPG`) — it streams, but there is no
@@ -251,13 +254,14 @@ Useful commands when a camera doesn't appear:
 ```bash
 lsusb                                              # is it enumerated at all?
 lsmod | grep uvcvideo                              # driver loaded?
-readlink -f /sys/class/video4linux/video0/device   # the path that must match the table above
-journalctl -u limelight_visionserver -n 50 --no-pager | grep -i camera
+readlink -f /sys/class/video4linux/video0/device   # the real path (before the shim)
+journalctl -u limelight_visionserver -n 50 --no-pager | grep -iE "shim|camera"
 ```
 
 Note this Buildroot userspace has **no `timeout`, `pkill` or `pgrep`** — use `killall`/`pidof`
-and the background-then-sleep-then-kill pattern. `strace` and `ltrace` are both present, and
-tracing `%file` is how the path comparison above was identified.
+and the background-then-sleep-then-kill pattern. `strace` is present (`ltrace` is too but
+could not hook this binary's PLT); tracing `%file` is how the path comparison above was
+identified, and `readelf --dyn-syms` is how the fortified entry point was found.
 
 ## Diagnosing a non-starting robot.service on an already-flashed image
 
@@ -278,7 +282,8 @@ sudo journalctl -u robot.service -n 50 --no-pager
 - SystemCore version: 2027.0.0 Beta 14 (limelightosr-2027.0.0-beta14-210; `-201` was deleted upstream on 2026-09-02)
 - Confirmed on hardware (Pi 5B, Beta 14 image built by this repo, Aug 2026): boots from SD;
   `limelight_expandfs` grew rootfs A to 6.8G (5.1G free); two USB-CAN adapters enumerate on
-  `1-1`/`1-2`; RP2350 present as `cafe:4011` on `3-2`; USB camera works once behind a hub.
+  `1-1`/`1-2`; RP2350 present as `cafe:4011` on `3-2`; USB camera works on a bare port with the
+  camera shim (v4) and behind a hub without it.
   That image (v1, build 201) loaded `robot_heartbeat` too early to work — see patch 9.
   Unverified on hardware: the v2 image (build 210) as a whole, and specifically that
   `robot_heartbeat` now loads from the canbusprocess tail (`ls -l /dev/mrccan` — character

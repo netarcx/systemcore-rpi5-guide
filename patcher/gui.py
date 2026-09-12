@@ -65,6 +65,7 @@ class PatcherGUI:
         ("install_robot_override", "robot.service override"),
         ("install_mrccan", "/dev/mrccan tmpfile (MrcCommDaemon fallback)"),
         ("install_modules_load", "Load i2c-dev at boot"),
+        ("install_camera_shim", "Camera on a bare Pi 5B USB port (realpath shim)"),
         ("install_regdb", "Wireless regulatory database"),
         ("patch_dashboard_wlan", "Dashboard: unlock WLAN0 AP"),
         ("patch_dashboard_faults", "Dashboard: fault count reset button"),

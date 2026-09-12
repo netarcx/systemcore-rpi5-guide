@@ -10,10 +10,10 @@ cd systemcore-rpi5-guide
 sudo ./build-image.sh
 ```
 
-This produces `systemcore-pi5b-2027.0.0-beta14-v3.img` — flash it to an SD card and boot:
+This produces `systemcore-pi5b-2027.0.0-beta14-v4.img` — flash it to an SD card and boot:
 
 ```bash
-sudo dd if=systemcore-pi5b-2027.0.0-beta14-v3.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v4.img of=/dev/sdX bs=4M status=progress
 ```
 
 Insert the SD card into your Pi 5 and power on. No further configuration needed.
@@ -158,16 +158,22 @@ Place `debugfs.exe` in `patcher_win/tools/` — see the README there for where t
 Verify the result with `e2fsck -fn` on the rootfs partition if you want extra confidence; a
 correct run reports no errors.
 
-### USB cameras need a USB hub
+### USB cameras
 
-A camera plugged straight into the Pi 5B enumerates fine but never appears on the dashboard's
-camera page — the vision servers match cameras against a sysfs path that includes the Limelight
-carrier board's internal USB hub, which a Pi 5B doesn't have.
+A camera plugged straight into any Pi 5B USB port works (the image includes a small
+`LD_PRELOAD` shim, see [Camera shim](#camera-shim) below). Cameras behind a hub keep
+working too. Each vision server instance claims one port through its `usb_id`:
 
-**Plug a USB hub into one of the black USB 2.0 ports and the camera into the hub.** The path
-then matches what the stock software expects, with no patching. The blue USB 3.0 ports are on a
-different controller and won't work for this. See CLAUDE.md for the port-to-instance mapping if
-you want more than one camera.
+| Pi 5B port | `usb_id: 0` (default, any server) | `usb_id: 1` |
+| --- | --- | --- |
+| black USB 2.0 next to Ethernet (`3-1`) | yes | — |
+| other black USB 2.0 (`3-2`) | — | `visionserver1` |
+| blue USB 3.0 (`1-1`) | — | `visionserver2` |
+| blue USB 3.0 (`1-2`) | — | `visionserver3` |
+
+All four servers ship with `usb_id: 0`, so with one camera on `3-1` the first server takes it
+and the others log "no camera on this port" — that's expected, not a fault. For a second
+camera, set the matching server's `usb_id` to 1 in the dashboard.
 
 ## What `build-image.sh` does
 
@@ -264,6 +270,17 @@ upstream re-minifies on every build — `beta14-201`'s `disabled:o||a` became
 the bundle for all four patches (and runs `node --check` on it when `node` is on PATH),
 so that failure mode can't pass unnoticed again.
 
+### Camera shim
+
+Each `visionserverN` compares a camera's canonical sysfs path against one hard-coded path
+that includes the Limelight carrier board's internal USB hub (`…/usb3/3-1/3-1.1/3-1.1:1.0`).
+A camera on a bare Pi 5B port has no hub level, so stock binaries never accept it.
+`patcher/resources/camera-shim/pi5b-camera-shim.so` is loaded into the four vision servers
+via a systemd drop-in (`Environment=LD_PRELOAD=…`) and wraps `realpath()` so a camera that
+sits directly on a root port is presented under the hub path — nothing else changes, and
+cameras already behind a hub pass through untouched. Source and a rebuild script live next
+to the binary. Override the port table with `PI5B_CAMERA_PORTS` in the drop-in if needed.
+
 ### Wireless regulatory database
 
 The stock image is missing `regulatory.db`. The build script installs the US regulatory database so WiFi works correctly (paired with `cfg80211.ieee80211_regdom=US` in the kernel cmdline).
@@ -325,7 +342,7 @@ netboot/                - Network boot setup (development/debugging)
 Files not tracked in git (generated/downloaded):
 ```
 cache/<release-tag>/              - Downloaded upstream image zip, keyed by release tag
-systemcore-pi5b-2027.0.0-beta14-v3.img   - Output image (~2.2GB, expands to 14GB on first boot)
+systemcore-pi5b-2027.0.0-beta14-v4.img   - Output image (~2.2GB, expands to 14GB on first boot)
 netboot/tftpboot/                 - TFTP boot files (kernel, DTBs, overlays)
 netboot/nfsroot/                  - NFS root mount point
 ```

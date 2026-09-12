@@ -6,7 +6,7 @@
 # patcher/ and patcher/resources/ so there is exactly one copy of each.
 set -euo pipefail
 
-PI5B_VERSION="v3"
+PI5B_VERSION="v4"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -97,6 +97,7 @@ echo "    - /dev/mrccan tmpfile fallback (unblocks MrcCommDaemon -> robot.servic
 echo "    - i2c-dev loaded at boot"
 echo "    - Wireless regulatory database (US WiFi channels, if not already present)"
 echo "    - Dashboard: WLAN0 AP settings unlocked, fault count reset button"
+echo "    - USB camera works on a bare Pi 5B port (realpath shim for visionserver)"
 echo ""
 echo "  Flash to SD card:"
 echo "    sudo dd if=$OUTPUT_IMG of=/dev/sdX bs=4M status=progress"
