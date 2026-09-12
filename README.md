@@ -10,10 +10,10 @@ cd systemcore-rpi5-guide
 sudo ./build-image.sh
 ```
 
-This produces `systemcore-pi5b-2027.0.0-beta14-v2.img` — flash it to an SD card and boot:
+This produces `systemcore-pi5b-2027.0.0-beta14-v3.img` — flash it to an SD card and boot:
 
 ```bash
-sudo dd if=systemcore-pi5b-2027.0.0-beta14-v2.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v3.img of=/dev/sdX bs=4M status=progress
 ```
 
 Insert the SD card into your Pi 5 and power on. No further configuration needed.
@@ -218,7 +218,6 @@ The stock image expects 5 SPI CAN interfaces (`can_s0` through `can_s4`). The bu
 - **Discovery frame** — `cansend 000#00` sent on each bus after interface up
 - **Hot-plug** — plugging in a new adapter triggers automatic naming and configuration
 - **vcan placeholders auto-fill missing buses** — the WPILib HAL iterates `can_s0` through `can_s4` and aborts the robot program if any are missing (`ioctl(SIOCGIFINDEX) for CAN can_sN failed with No such device` → `Failed to initialize. Terminating`). After USB-CAN setup, the service creates vcan interfaces for whichever slots have no physical adapter, so 0–4 USB adapters all work.
-- **Bus-off recovery** — physical adapters are configured with `restart-ms 1000`, so a controller that goes bus-off comes back on its own
 - **canbuswatchdog/robot.service overrides** — the watchdog waits for any `can_s*`; `robot.service` waits up to 30s for all five `can_s0..can_s4` to exist (vcan placeholders report `state UNKNOWN` and never come UP, so existence is the only workable test), then starts regardless
 
 If no CAN adapter is plugged in, all services time out gracefully and the robot starts anyway (vcan placeholders satisfy the HAL).
@@ -269,6 +268,24 @@ so that failure mode can't pass unnoticed again.
 
 The stock image is missing `regulatory.db`. The build script installs the US regulatory database so WiFi works correctly (paired with `cfg80211.ieee80211_regdom=US` in the kernel cmdline).
 
+## Phoenix Tuner X and CTRE devices
+
+Nothing Phoenix-specific is (or can be) pre-installed in the image:
+
+- **Tuner X / diagnostics** — on SystemCore the Phoenix diagnostic server lives inside the
+  robot program (Phoenix 6 vendordep), not in the OS. Deploy a robot program that constructs
+  at least one Phoenix 6 device and Tuner X can connect; the roboRIO-style "temporary
+  diagnostic server" is not available on SystemCore. Use the Phoenix 6 release that matches
+  your WPILib alpha (build 210 needs WPILib 2027 Alpha 7 and a matching vendordep).
+- **Bus selection** — `CANBus.systemCore(n)` picks `can_s<n>`; a device constructed without a
+  bus uses Phoenix's SystemCore default, which is `can_s1`, so with a single USB-CAN adapter
+  (renamed `can_s0`) pass the bus explicitly.
+- **CANivore** — CTRE's `canivore-usb-kernel_1.18` package (the dashboard-installable
+  driver) was built against an earlier Beta 14 kernel and does **not** load on build 210
+  (`disagrees about version of symbol module_layout`); CTRE has not published a newer
+  build. The `canivore-usb` userspace package installs but is useless without it. This
+  project does not touch either — plug in USB-CAN adapters instead.
+
 ## Known limitations
 
 - **RP2350 firmware faults** — After flashing, the Pico firmware reports faults for hardware it expects on the carrier board (BROWNOUT, IMU, DISPLAY, CAN, RSL). These are cosmetic — USB communication works fine. The firmware is closed-source so these cannot be fixed. Use the "Reset Fault Counts" button to clear them.
@@ -308,7 +325,7 @@ netboot/                - Network boot setup (development/debugging)
 Files not tracked in git (generated/downloaded):
 ```
 cache/<release-tag>/              - Downloaded upstream image zip, keyed by release tag
-systemcore-pi5b-2027.0.0-beta14-v2.img   - Output image (~2.2GB, expands to 14GB on first boot)
+systemcore-pi5b-2027.0.0-beta14-v3.img   - Output image (~2.2GB, expands to 14GB on first boot)
 netboot/tftpboot/                 - TFTP boot files (kernel, DTBs, overlays)
 netboot/nfsroot/                  - NFS root mount point
 ```

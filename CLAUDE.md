@@ -45,7 +45,7 @@ Consequences for the patcher:
 ```bash
 # Build from scratch (downloads the pinned upstream release, then patches it)
 sudo ./build-image.sh
-sudo dd if=systemcore-pi5b-2027.0.0-beta14-v2.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v3.img of=/dev/sdX bs=4M status=progress
 
 # Any upstream image (Alpha or Beta, auto-detected)
 sudo python3 patch-image.py upstream.img
@@ -180,8 +180,23 @@ carries `bcm2712-rpi-5-b.dtb`, an `[all]` config.txt section, and a real `cmdlin
 - `patcher_win` (the no-WSL path) writes partitions directly, and three of its primitives were silently wrong until they were exercised end-to-end against Beta 14. Re-check these if that code is touched: FAT lookups must be case-insensitive (pyfatfs reports 8.3 entries upper-cased, so `/config.txt` misses `CONFIG.TXT`); pyfatfs closes the stream handed to it, so the buffer must survive `close()` for the write-back; and `debugfs` needs `set_inode_field <path> mode 0100644` (with the S_IFREG bits) plus a guard against `mkdir` on paths that already exist, or the result is a filesystem that fails `e2fsck` and throws EIO on readdir. Validate any change with `e2fsck -fn` on the extracted rootfs — the patcher's own `--validate` passed on an image the kernel refused to read.
 - Upstream ships `limelight_canbusprocess.service` as `Type=oneshot`/`RemainAfterExit=yes` (Beta 14). Our drop-in's ExecStart never returns and sets `Restart=always`, which systemd refuses on a oneshot unit ("isn't allowed for Type=oneshot services. Refusing.") — so the drop-in also sets `Type=simple`/`RemainAfterExit=no`. Check drop-ins against a new release with `systemd-analyze verify <unit>` before flashing.
 - Upstream `robot.service` (Beta 14) waits up to 15s for `can_s0..can_s4` to be `state UP` and starts anyway on timeout; our override replaces that ExecStartPre with a 30s wait for all five `/sys/class/net/can_s0..can_s4` to **exist** (a vcan placeholder is `state UNKNOWN` and never comes UP, so upstream's UP test would always burn the full timeout), then starts regardless
-- Physical CAN interfaces are brought up with `restart-ms 1000` so a bus-off adapter auto-recovers; the vcan placeholders are created after that and never get CAN link settings
+- `ip link set <if> type can ...` applies attributes in order and aborts at the first the driver rejects, keeping the earlier ones. gs_usb returns EOPNOTSUPP for `restart-ms`, so a trailing `restart-ms 1000` left `fd on` set with no data bit-timing and `ip link set up` failed with `incorrect/missing data bit-timing` (seen on a CANable 2.5). Never append attributes gs_usb doesn't support, and the classic-CAN fallback must say `fd off` explicitly. Verified on hardware: CANable 2.5 (`1d50:606f`, 160 MHz clock) runs CAN FD 1M/5M; the older candleLight falls back to classic CAN
 - Upstream `70-can-interface-names.rules` names the carrier board's SPI CAN controllers (`spi2.0` → `can_s0`, etc.). It never matches on Pi 5B since the SPI overlays are commented out, so it doesn't conflict with `90-usb-can-rename.rules`.
+
+- Phoenix / CTRE on SystemCore: the Phoenix diagnostic server that Tuner X talks to is part
+  of the robot program (Phoenix 6 vendordep), so there is nothing to pre-install; Tuner X
+  needs a deployed program that constructs a Phoenix 6 device. Phoenix's default SystemCore
+  bus is `can_s1` (`CANBus.systemCore(n)` selects `can_s<n>`). CTRE's dashboard-installable
+  CANivore packages (`https://ctre.download/files/systemcore/canivore-usb-kernel_1.18_aarch64.ipk`
+  + `canivore-usb_1.16_aarch64.ipk`) do not work on build 210: the module was built against an
+  earlier Beta 14 kernel and fails with `disagrees about version of symbol module_layout`
+  (CRCs differ from the 210 tree's `Module.symvers`). Rebuilding it needs the 210 kernel
+  tree + toolchain from the release assets (`systemcorebetalinux.tar.xz` is a fully built
+  tree with `.config` and `Module.symvers`; `crosscomp_examples/kernel` in the upstream repo
+  shows the flow) and CTRE's driver source, of which only `canivore-usb_1.8_arm64.deb`
+  (DKMS, 2022, `canivore-usb-util.o` shipped as a binary) is public. Deliberately not done —
+  the project targets plain USB-CAN adapters. The image installs add-on packages with `opkg`
+  (`/var/lib/opkg/status`, dashboard `/api/packages/*` on port 4803).
 
 ## USB cameras require a USB hub (confirmed on hardware)
 

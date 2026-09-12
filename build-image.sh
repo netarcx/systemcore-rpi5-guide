@@ -6,7 +6,7 @@
 # patcher/ and patcher/resources/ so there is exactly one copy of each.
 set -euo pipefail
 
-PI5B_VERSION="v2"
+PI5B_VERSION="v3"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
