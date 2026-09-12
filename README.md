@@ -10,10 +10,10 @@ cd systemcore-rpi5-guide
 sudo ./build-image.sh
 ```
 
-This produces `systemcore-pi5b-2027.0.0-beta14-v4.img` — flash it to an SD card and boot:
+This produces `systemcore-pi5b-2027.0.0-beta14-v5.img` — flash it to an SD card and boot:
 
 ```bash
-sudo dd if=systemcore-pi5b-2027.0.0-beta14-v4.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v5.img of=/dev/sdX bs=4M status=progress
 ```
 
 Insert the SD card into your Pi 5 and power on. No further configuration needed.
@@ -230,6 +230,22 @@ If no CAN adapter is plugged in, all services time out gracefully and the robot 
 
 Compatible with any SocketCAN-supported USB adapter (candleLight/canable, PEAK, EMS, etc.). Mixed CAN FD and standard CAN adapters work together.
 
+### Unplug / replug (verified on hardware)
+
+- **CAN adapter unplugged:** its `can_sN` disappears, the CAN service notices within ~2 s,
+  releases the heartbeat module's hold on the interface (so the kernel can finish removing
+  it), puts a vcan placeholder in that slot and reloads the heartbeat. The robot program keeps
+  running; the other buses are untouched (placeholders are never recreated needlessly, so the
+  HAL's sockets to them stay valid).
+- **CAN adapter plugged back in:** the udev rule restarts the CAN service, the adapter takes
+  its remembered slot back (`/etc/can_port_map`), the heartbeat is reloaded with the real bus,
+  and `robot.service` is restarted — a re-enumerated adapter has a new interface index, so the
+  running HAL could never talk to it again otherwise. A stock SystemCore never has to deal
+  with this (its CAN controllers are soldered on), which is why upstream doesn't.
+- **Camera unplugged / replugged:** nothing extra needed — the vision server drops the camera
+  and its periodic rescan picks it up again a few seconds after it reappears, streaming
+  resumes.
+
 ### MrcCommDaemon unblock (`/dev/mrccan/`)
 
 `MrcCommDaemon` is the userspace service that sets the NetworkTables key `/Netcomm/Control/ServerReady`. The WPILib HAL waits on this key during robot startup — if `MrcCommDaemon` isn't running, the Java robot program SIGABRTs ~10 seconds after launch with `Error: Waiting for server ready failed. Restarting app and retrying...` and `terminate called without an active exception`.
@@ -342,7 +358,7 @@ netboot/                - Network boot setup (development/debugging)
 Files not tracked in git (generated/downloaded):
 ```
 cache/<release-tag>/              - Downloaded upstream image zip, keyed by release tag
-systemcore-pi5b-2027.0.0-beta14-v4.img   - Output image (~2.2GB, expands to 14GB on first boot)
+systemcore-pi5b-2027.0.0-beta14-v5.img   - Output image (~2.2GB, expands to 14GB on first boot)
 netboot/tftpboot/                 - TFTP boot files (kernel, DTBs, overlays)
 netboot/nfsroot/                  - NFS root mount point
 ```

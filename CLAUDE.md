@@ -45,7 +45,7 @@ Consequences for the patcher:
 ```bash
 # Build from scratch (downloads the pinned upstream release, then patches it)
 sudo ./build-image.sh
-sudo dd if=systemcore-pi5b-2027.0.0-beta14-v4.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v5.img of=/dev/sdX bs=4M status=progress
 
 # Any upstream image (Alpha or Beta, auto-detected)
 sudo python3 patch-image.py upstream.img
@@ -182,6 +182,7 @@ carries `bcm2712-rpi-5-b.dtb`, an `[all]` config.txt section, and a real `cmdlin
 - `patcher_win` (the no-WSL path) writes partitions directly, and three of its primitives were silently wrong until they were exercised end-to-end against Beta 14. Re-check these if that code is touched: FAT lookups must be case-insensitive (pyfatfs reports 8.3 entries upper-cased, so `/config.txt` misses `CONFIG.TXT`); pyfatfs closes the stream handed to it, so the buffer must survive `close()` for the write-back; and `debugfs` needs `set_inode_field <path> mode 0100644` (with the S_IFREG bits) plus a guard against `mkdir` on paths that already exist, or the result is a filesystem that fails `e2fsck` and throws EIO on readdir. Validate any change with `e2fsck -fn` on the extracted rootfs — the patcher's own `--validate` passed on an image the kernel refused to read.
 - Upstream ships `limelight_canbusprocess.service` as `Type=oneshot`/`RemainAfterExit=yes` (Beta 14). Our drop-in's ExecStart never returns and sets `Restart=always`, which systemd refuses on a oneshot unit ("isn't allowed for Type=oneshot services. Refusing.") — so the drop-in also sets `Type=simple`/`RemainAfterExit=no`. Check drop-ins against a new release with `systemd-analyze verify <unit>` before flashing.
 - Upstream `robot.service` (Beta 14) waits up to 15s for `can_s0..can_s4` to be `state UP` and starts anyway on timeout; our override replaces that ExecStartPre with a 30s wait for all five `/sys/class/net/can_s0..can_s4` to **exist** (a vcan placeholder is `state UNKNOWN` and never comes UP, so upstream's UP test would always burn the full timeout), then starts regardless
+- Hot-plug (verified 2026-09-12 by de/re-authorizing the USB device via sysfs): unplug → `can_sN` vanishes → monitor loop exits → restart stops the `/dev/mrccan` holders, unloads `robot_heartbeat`/`can_sender` (releasing the netdev ref that would otherwise block the kernel's unregister forever), fills the slot with a vcan, reloads the module; robot.service is left alone. Replug → `90-usb-can-rename.rules` restarts the unit → the vcan in that slot is deleted, the adapter renamed back, heartbeat reloaded, and **robot.service is restarted** because the set of physical adapters changed (`/run/pi5b-can-physical`; a re-enumerated adapter has a new ifindex and the HAL's sockets can't follow). Placeholders otherwise persist across restarts so the HAL's vcan sockets stay valid; the wait-for-adapters loop is satisfied by an existing vcan, so restarts don't burn the 30 s boot-time wait. `/run/pi5b-can-holders` remembers which daemons were stopped so a restart that interrupts a reload still brings them back. Camera unplug/replug needs nothing: visionserver drops and re-finds it on its own rescan.
 - `ip link set <if> type can ...` applies attributes in order and aborts at the first the driver rejects, keeping the earlier ones. gs_usb returns EOPNOTSUPP for `restart-ms`, so a trailing `restart-ms 1000` left `fd on` set with no data bit-timing and `ip link set up` failed with `incorrect/missing data bit-timing` (seen on a CANable 2.5). Never append attributes gs_usb doesn't support, and the classic-CAN fallback must say `fd off` explicitly. Verified on hardware: CANable 2.5 (`1d50:606f`, 160 MHz clock) runs CAN FD 1M/5M; the older candleLight falls back to classic CAN
 - Upstream `70-can-interface-names.rules` names the carrier board's SPI CAN controllers (`spi2.0` → `can_s0`, etc.). It never matches on Pi 5B since the SPI overlays are commented out, so it doesn't conflict with `90-usb-can-rename.rules`.
 
@@ -223,7 +224,8 @@ the servers never open anything under the canonical path. Cameras already behind
 hardware: a UVC camera on the black port `3-1` is picked up as
 `found camera at .../3-1/3-1.1/3-1.1:1.0` → `USB camera generic-UVC ... locked to
 1280x720@30 MJPG`. The shim logs one line, `pi5b-camera-shim: presenting <real> as <fake>`,
-in each server's journal.
+in each server's journal. Unplug/replug needs nothing extra: the server drops the camera and its
+periodic rescan re-finds it within seconds (verified via sysfs `authorized` toggling).
 
 Physical port → virtual hub port → which instance claims it (`usb_id` lives in
 `/usr/local/bin/visionserverN/global.settings`, settable via the dashboard `set_usb_id` API;
