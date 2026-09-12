@@ -24,6 +24,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
+from . import dashboard
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -176,11 +178,11 @@ PATCH_DESCRIPTIONS: dict[str, str] = {
     "comment_pi4_firmware": "Comment out Pi 4 firmware references in config.txt (Alpha 2-10)",
     "install_flash_pico": "Install flash-pico.sh + picoflasherprocess override",
     "install_can_udev": "Install 90-usb-can-rename.rules (USB-only trigger)",
-    "install_canbusprocess": "Install canbusprocess override with vcan placeholders",
+    "install_canbusprocess": "Install canbusprocess override (vcan placeholders + heartbeat)",
     "install_canbuswatchdog": "Install canbuswatchdog override (waits for any can_s*)",
-    "install_robot_override": "Install robot.service override (30s CAN wait, optional)",
-    "install_mrccan": "Install /etc/tmpfiles.d/mrccan.conf (unblocks MrcCommDaemon)",
-    "install_modules_load": "Load robot_heartbeat + i2c-dev at boot (creates /dev/mrccan/*)",
+    "install_robot_override": "Install robot.service override (30s wait for can_s0..s4)",
+    "install_mrccan": "Install /etc/tmpfiles.d/mrccan.conf (MrcCommDaemon fallback)",
+    "install_modules_load": "Load i2c-dev at boot (robot_heartbeat comes from canbusprocess)",
     "install_regdb": "Install wireless-regdb so WiFi works on US regulatory domain",
     "patch_dashboard_wlan": "Unlock WLAN0 AP settings in the dashboard JS",
     "patch_dashboard_faults": "Add a 'Reset Fault Counts' button to the dashboard",
@@ -739,86 +741,35 @@ def _install_regdb(mount: Path, deb: Path, log: logging.Logger,
 
 def _patch_dashboard(mount: Path, opts: PatchOptions, log: logging.Logger,
                      label: str) -> None:
-    """Apply sed-style patches to the minified React dashboard JS."""
-    js_files = list((mount / "var/www/html/static/js").glob("main.*.js"))
-    if not js_files:
+    """Apply the dashboard patches to the minified React bundle.
+
+    Every transform lives in `patcher.dashboard`, shared verbatim with the
+    Windows patcher, so the two can't drift.
+    """
+    js = _find_dashboard_js(mount)
+    if js is None:
         log.warning("[%s] Dashboard main.*.js not found, skipping dashboard patches",
                     label)
         return
-    js = js_files[0]
     log.info("[%s] Patching dashboard at %s", label, js.name)
 
-    if opts.patch_dashboard_wlan:
-        sed_inplace(js, r"disabled:o\|\|a", "disabled:o", log, opts.dry_run)
-        sed_inplace(
-            js,
-            r',\{static_ip:"172\.30\.0\.1",gateway:"172\.30\.0\.1",use_dhcp:!1\}',
-            ",{}",
-            log,
-            opts.dry_run,
-        )
-
-    if opts.patch_dashboard_faults:
-        # Frontend-only baseline offset for fault counts.
-        sed_inplace(
-            js,
-            r"faultCounts:t\.fc\|\|\[0,0,0,0,0,0\]",
-            "faultCounts:(window.__rawFC=t.fc||[0,0,0,0,0,0]).map(function(v,j){"
-            "return Math.max(0,v-((window.__faultBL||[])[j]||0))})",
-            log,
-            opts.dry_run,
-        )
-        _inject_fault_reset_button(js, log, opts.dry_run, label)
-
-
-# Marker used to make the fault-button injection idempotent.
-FAULT_RESET_MARKER = "window.__faultBL=window.__rawFC"
-
-# End of the historical fault list — the `]` closes the tooltip's children
-# array, which is where the button gets appended.
-FAULT_LIST_TAIL_RE = r'"historical-"\.concat\(t\)\)\}\)\)\]'
-
-# The bundler minifies the react/jsx-runtime import to a different name in
-# every build ("xo" in Beta 10, "bo" in Beta 14), so the alias has to be read
-# out of the surrounding code rather than hardcoded — the injected markup
-# throws a ReferenceError and blanks the dashboard if it names the wrong one.
-JSX_ALIAS_RE = r"\(0,(\w+)\.jsx\)"
-
-
-def _inject_fault_reset_button(js: Path, log: logging.Logger, dry_run: bool,
-                               label: str) -> None:
-    """Append a "Reset Fault Counts" button to the dashboard fault tooltip."""
     text = js.read_text(encoding="utf-8", errors="surrogateescape")
-    if FAULT_RESET_MARKER in text:
-        log.info("[%s] Fault reset button already present, skipping", label)
-        return
-
-    m = re.search(FAULT_LIST_TAIL_RE, text)
-    if not m:
-        log.warning("[%s] Fault history list not found in %s — dashboard layout "
-                    "changed upstream; skipping fault reset button", label, js.name)
-        return
-
-    # The nearest jsx() call before the list is the one rendering it.
-    aliases = re.findall(JSX_ALIAS_RE, text[max(0, m.start() - 500):m.start()])
-    if not aliases:
-        log.warning("[%s] Could not determine the jsx alias near the fault list; "
-                    "skipping fault reset button", label)
-        return
-    jsx = aliases[-1]
-    button = (
-        f'"historical-".concat(t))}})),'
-        f'(0,{jsx}.jsx)("div",{{style:{{marginTop:"8px",textAlign:"center"}},'
-        f'children:(0,{jsx}.jsx)("button",{{onClick:function(){{'
-        f'{FAULT_RESET_MARKER}?window.__rawFC.slice():[]}},'
-        f'style:{{fontSize:"11px",padding:"2px 8px",cursor:"pointer",'
-        f'background:"#333",color:"#fff",border:"1px solid #666",'
-        f'borderRadius:"3px"}},children:"Reset Fault Counts"}})}})]'
+    patched = dashboard.apply_patches(
+        text, log, label,
+        wlan=opts.patch_dashboard_wlan,
+        faults=opts.patch_dashboard_faults,
     )
-    patched = text[:m.start()] + button + text[m.end():]
-    log.info("[%s] Injecting fault reset button (jsx alias: %s)", label, jsx)
-    if not dry_run:
+    if patched == text:
+        log.info("[%s] Dashboard unchanged", label)
+        return
+    if not opts.dry_run:
         js.write_text(patched, encoding="utf-8", errors="surrogateescape")
+
+
+def _find_dashboard_js(mount: Path) -> Optional[Path]:
+    """The dashboard bundle inside a mounted rootfs, or None."""
+    js_files = sorted((mount / "var/www/html/static/js").glob("main.*.js"))
+    return js_files[0] if js_files else None
 
 
 # ---------------------------------------------------------------------------
@@ -866,6 +817,7 @@ def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
                         problems.append(f"[{label}] missing: {rel}")
                     else:
                         log.debug("[%s] ok: %s", label, rel)
+                problems += _validate_dashboard(mnt, log, label)
     finally:
         tracker.cleanup(log)
     if not problems:
@@ -874,6 +826,38 @@ def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
     else:
         for p in problems:
             log.error(p)
+    return problems
+
+
+def _validate_dashboard(mount: Path, log: logging.Logger, label: str) -> list[str]:
+    """Check the dashboard bundle actually carries the patches.
+
+    File-existence checks can't see this: the bundle is always present, and a
+    sed whose pattern went stale leaves it looking untouched but working.
+    """
+    js = _find_dashboard_js(mount)
+    if js is None:
+        return [f"[{label}] dashboard main.*.js not found"]
+    text = js.read_text(encoding="utf-8", errors="surrogateescape")
+    problems = [f"[{label}] dashboard {js.name}: {p}"
+                for p in dashboard.check_patched(text)]
+    if not problems:
+        log.info("[%s] ok: dashboard %s (AP unlocked, fault reset button, "
+                 "fault baseline)", label, js.name)
+
+    node = shutil.which("node")
+    if node:
+        res = subprocess.run([node, "--check", str(js)],
+                             capture_output=True, text=True)
+        if res.returncode != 0:
+            problems.append(f"[{label}] dashboard {js.name}: node --check failed: "
+                            f"{res.stderr.strip().splitlines()[0] if res.stderr.strip() else ''}")
+        else:
+            log.info("[%s] ok: dashboard %s parses (node --check)", label, js.name)
+    else:
+        log.info("[%s] node not on PATH, skipping syntax check of %s "
+                 "(sudo drops nvm's PATH — re-run with `sudo -E env PATH=$PATH` "
+                 "to enable it)", label, js.name)
     return problems
 
 

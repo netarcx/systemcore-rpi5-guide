@@ -16,9 +16,13 @@ identically — `alpha` in the table above means only the *legacy* Alpha 2–10 
 The patcher auto-detects from the partition layout; `--image-type alpha|ab` overrides
 (`beta`/`beta10` are accepted spellings of `ab`).
 
-Current target: **`limelightosr-2027.0.0-beta14-201`** (Aug 2026). `build-image.sh` pins the
-release in `RELEASE_TAG`/`RELEASE_NAME`; new releases are listed at
-https://github.com/LimelightVision/systemcore-os-public/releases
+Current target: **`limelightosr-2027.0.0-beta14-210`** (Sep 2026), which replaced the
+deleted `beta14-201`. Robot programs on it need **WPILib 2027 Alpha 7+** (upstream release
+note; the HAL ships with the robot code, so there is nothing to patch). `build-image.sh`
+pins the release in `RELEASE_TAG`/`RELEASE_NAME` and caches the zip under
+`cache/<RELEASE_TAG>/` — upstream reuses zip filenames across rebuilds of a release, so a
+name-keyed cache silently serves the stale image after a tag bump. New releases are listed
+at https://github.com/LimelightVision/systemcore-os-public/releases
 
 ### Packed images (Beta 14 / Alpha 14 and later)
 
@@ -41,7 +45,7 @@ Consequences for the patcher:
 ```bash
 # Build from scratch (downloads the pinned upstream release, then patches it)
 sudo ./build-image.sh
-sudo dd if=systemcore-pi5b-2027.0.0-beta14-v1.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v2.img of=/dev/sdX bs=4M status=progress
 
 # Any upstream image (Alpha or Beta, auto-detected)
 sudo python3 patch-image.py upstream.img
@@ -55,6 +59,7 @@ build-image.sh        - Downloads the pinned upstream release, then calls patch-
 patch-image.py        - Standalone patcher for new upstream releases
 patcher/              - Python package backing patch-image.py
   core.py             - Partition discovery, mount tracking, per-patch logic, orchestrator
+  dashboard.py        - Minified-dashboard JS transforms, shared with patcher_win
   gui.py              - Tkinter GUI with live log streaming + per-patch toggles
   cli.py              - argparse, --dry-run / --inspect / --validate / --only
   resources/          - Drop-in service overrides + udev rules + tmpfile/modules-load configs
@@ -90,8 +95,8 @@ Not tracked in git: `cache/`, `*.img`, `*.zip`, `netboot/tftpboot/`, `netboot/nf
 6. **CAN is optional** — 30s timeout, robot starts regardless of adapter presence
 7. **CAN discovery frame** — `cansend 000#00` sent on each bus after interface up
 8. **vcan placeholders** — canbusprocess fills missing `can_s0..can_s4` slots with vcan interfaces after USB-CAN setup. HAL aborts the robot program if any of the 5 buses is missing (`SIOCGIFINDEX ... No such device`), so this is required for robot.service to start with fewer than 5 physical adapters.
-9. **/dev/mrccan tmpfile** — `/etc/tmpfiles.d/mrccan.conf` creates `/dev/mrccan/` at boot. Without it `MrcCommDaemon` crash-loops on `Failed to open control data file`, never sets the NT key `/Netcomm/Control/ServerReady`, and the HAL SIGABRTs the robot program ~10s after start with `Error: Waiting for server ready failed`.
-10. **robot_heartbeat + i2c-dev loaded at boot** — `/etc/modules-load.d/systemcore-pi5b.conf`. Upstream modprobes these at the tail of `limelight_canbusprocess.service`'s ExecStart, which this project replaces wholesale — so without this file they never load. `robot_heartbeat` (pulls in `can_sender`) registers the misc devices `mrccan!controldata`, `mrccan!matchinfo`, `mrccan!onbot_override` and their read-only variants, i.e. the real `/dev/mrccan/*` nodes MrcCommDaemon opens. Loading it via modules-load.d rather than from the service means the nodes exist before `mrccomm.service` starts, so MrcCommDaemon can't get there first and leave regular files on those paths. The tmpfile above stays as the fallback for when the module is missing or fails to load.
+9. **robot_heartbeat loaded after the buses exist** — the tail of the canbusprocess override, *after* the vcan loop: stop `mrccomm.service`, `rmmod robot_heartbeat`/`can_sender`, delete any regular files left on `/dev/mrccan/*`, `modprobe robot_heartbeat`, start `mrccomm.service`. `can_sender` (robot_heartbeat's dependency) enumerates `can_s*` netdevs in its module init and returns `-ENODEV` (`CAN Sender: No CAN devices found`) when there are none, and it snapshots the ≤5 devices it finds — so loading it any earlier (modules-load.d, or the top of the ExecStart) is a silent no-op on a Pi 5B and no enable heartbeat is ever sent, i.e. motors never enable even though robot code runs. Reloading needs MrcCommDaemon's fds closed, hence the stop/start. Upstream's own unit modprobes it last for the same reason.
+10. **/dev/mrccan tmpfile (fallback)** — `/etc/tmpfiles.d/mrccan.conf` creates `/dev/mrccan/` at boot. Only for when `robot_heartbeat` is missing or fails to load: with the bare directory present MrcCommDaemon creates *regular files* and still publishes `/Netcomm/Control/ServerReady`, so robot code starts — but without the module there's no CAN heartbeat. With neither, MrcCommDaemon crash-loops on `Failed to open control data file` and the HAL SIGABRTs the robot program ~10s after start with `Error: Waiting for server ready failed`. `/etc/modules-load.d/systemcore-pi5b.conf` still loads **i2c-dev** at boot (upstream modprobes it from the ExecStart this project replaces).
 11. **Wireless regdb** — regulatory.db installed for US WiFi channel support. Skipped when the image already ships `/usr/lib/firmware/regulatory.db` (true since Beta 14).
 12. **WLAN0 AP settings unlocked** — dashboard JS patched to allow modifying Access Point config
 13. **Fault count reset button** — frontend-only baseline reset added to fault tooltip in dashboard
@@ -111,8 +116,19 @@ carries `bcm2712-rpi-5-b.dtb`, an `[all]` config.txt section, and a real `cmdlin
 ## Key technical details
 
 - Current upstream image: `limelightsystemcorebetacm5-limelightosr-2027.0.0-beta14.zip`
-  (release `limelightosr-2027.0.0-beta14-201`); the matching alpha is
-  `limelightsystemcorecm5-limelightosr-2027.0.0-alpha14.zip` and patches identically
+  (release `limelightosr-2027.0.0-beta14-210`, Sep 2026); the matching alpha is
+  `limelightsystemcorecm5-limelightosr-2027.0.0-alpha14.zip` (release `alpha14-380`), built
+  from the same source commit — same partition table, same kernel, same dashboard bundle,
+  patches identically. Build 210 requires WPILib 2027 Alpha 7 in the robot program.
+  Differences 201 → 210 that matter here: config.txt dropped `boot_delay`,
+  `dtoverlay=miniuart-bt`, `dtoverlay=pi3-disable-bt` and added `uart_2ndstage=0` (every
+  HDMI/SPI-CAN regex still matches); `limelight_picoflasherprocess.service` gained
+  `DefaultDependencies=no` + `After=local-fs.target systemd-udevd.service`, which is fine
+  for flash-pico.sh (it only needs `udevadm`, `dd` and `/dev/sd*`);
+  `limelight_canbuswatchdog.service` gained `After=`/`Wants=limelight_canbusprocess.service`;
+  dnsmasq/dnsmasqwifi lost their `[Install]` and wifi DHCP now comes from a new
+  `/etc/dhcpcd.exit-hook` (so a "dead" `dnsmasqwifi` is normal); new
+  `limelight_supportbundle.service`
 - Alpha 2 upstream image: `limelightsystemcorecm5.zip` (release `Limelight_SYSTEMCORE-159`)
 - A/B partition layout (6 partitions), Beta 10+ / Alpha 11+:
   - p1: boot selector (FAT32, 16M) — autoboot.txt (`boot_partition=2`, `tryboot`→3)
@@ -140,7 +156,7 @@ carries `bcm2712-rpi-5-b.dtb`, an `[all]` config.txt section, and a real `cmdlin
 - CAN FD: 1Mbps nominal / 5Mbps data bitrate, falls back to 1Mbps standard CAN if adapter doesn't support FD
 - CAN port mapping persisted to `/etc/can_port_map` (port path -> can_sN index)
 - HAL CAN expectation: WPILib's HAL (`libwpiHal.so`, `_GLOBAL__N_1::SocketCanState::InitializeBuses`) does `SIOCGIFINDEX` on `can_s0` through `can_s4`. ANY missing one → `IllegalStateException: Failed to initialize. Terminating` from `org.wpilib.framework.RobotBase.startRobot`. canbusprocess fills gaps with vcan after USB-CAN setup.
-- HAL netcomm gate: HAL also blocks on NT key `/Netcomm/Control/ServerReady` (string lives in `libwpiHal.so`). The setter is `/usr/bin/MrcCommDaemon` (`mrccomm.service`), which opens `/dev/mrccan/controldata` + `/dev/mrccan/matchinfo` (`O_WRONLY|O_CREAT|O_TRUNC`). Those paths are the misc devices registered by the `robot_heartbeat` module (`kernel/net/can/robot_heartbeat.ko.xz`, depends on `can_sender`) — not carrier-board-specific hardware, it just has to be loaded, which the build now does via `/etc/modules-load.d/systemcore-pi5b.conf`. `/etc/tmpfiles.d/mrccan.conf` remains as the fallback: with the bare directory present, MrcCommDaemon creates plain files and still publishes ServerReady. Without either: `Failed to open control data file` → mrccomm crash-loops → HAL `Waiting for server ready failed` → SIGABRT (exit 134) ~10s after Java starts.
+- HAL netcomm gate: HAL also blocks on NT key `/Netcomm/Control/ServerReady` (string lives in `libwpiHal.so`). The setter is `/usr/bin/MrcCommDaemon` (`mrccomm.service`), which opens `/dev/mrccan/controldata` + `/dev/mrccan/matchinfo` (`O_WRONLY|O_CREAT|O_TRUNC`). Those paths are the misc devices registered by the `robot_heartbeat` module (`kernel/net/can/robot_heartbeat.ko.xz`, depends on `can_sender`) — not carrier-board-specific hardware, but it can only load once a `can_s*` netdev exists: `can_sender`'s init enumerates up to 5 `can_s*` devices, holds references to them, and returns `-ENODEV` (`CAN Sender: No CAN devices found`) if it finds none. The build therefore modprobes it from the **tail of the canbusprocess override**, after USB-CAN renaming and the vcan placeholders, and restarts `mrccomm.service` around it (a reload needs MrcCommDaemon's fds closed; stale *regular* files on `/dev/mrccan/*` are deleted first — `[ -f path ]` is false for a character device, so it only removes fallback leftovers). `/etc/tmpfiles.d/mrccan.conf` remains the fallback: with the bare directory present, MrcCommDaemon creates plain files and still publishes ServerReady, so robot code starts — but nothing sends the CAN enable heartbeat, so motors stay disabled. Without either: `Failed to open control data file` → mrccomm crash-loops → HAL `Waiting for server ready failed` → SIGABRT (exit 134) ~10s after Java starts.
 - Dashboard fault chain: RP2350 firmware → (libusb) `iodaemon` → NT `sys/faults` (struct
   `IOFaults`: brownout, io, rsl, usb, display, imu + counts) → `hwmon` (which adds
   `canbus_down`/`canbus_unavail` read from `can_s0..can_s4` itself) → websocket `hw` payload
@@ -155,12 +171,16 @@ carries `bcm2712-rpi-5-b.dtb`, an `[all]` config.txt section, and a real `cmdlin
   `0xCC`; leave bit 6 visible or you lose a working diagnostic. `iodaemon` has no config or
   CLI switch to quiet them; masking `limelight_iodaemon.service` kills bits 0-5 at the source
   (and also the IMU / Smart I/O topics, none of which exist on a Pi 5B).
-- Dashboard patches: sed on minified React JS (`main.*.js`), applied to every rootfs slot present. The fault-reset button injection must read the minified react/jsx-runtime alias out of the surrounding code (`xo` in Beta 10, `bo` in Beta 14) — hardcoding it throws a ReferenceError and blanks the dashboard. `node --check` on the patched JS catches this.
+- Dashboard patches: `patcher/dashboard.py`, shared verbatim by both patchers, applied to every rootfs slot present (`main.*.js` is `main.bb62576c.js` in 210/380). **No minified identifier may be hardcoded** — upstream re-minifies every build:
+  - jsx-runtime alias for the fault button: `xo` (Beta 10), `bo` (201), `Ro` (210/380); a wrong one throws a ReferenceError and blanks the dashboard.
+  - WLAN0 AP unlock: `renderInterfaceConfig=function(e){var …}` is located, the locals bound to `"wlan0"===e` and `<this>.state.waiting||…` are read out of its head, and `disabled:<busy>||<wlan>` is replaced with `disabled:<busy>` inside that function's span only (it ends at the next `,<this>.<name>=function`). 7 sites in 201, 210 and 380; the 8th, `disabled:<busy>||<eth0>`, must survive. The old hardcoded `disabled:o||a` sed matched nothing in 210 — silently, which is why zero-match dashboard seds now log WARNING and `--validate` re-checks the bundle.
+  - `--validate` fails if `window.__faultBL=window.__rawFC` or `window.__rawFC=t.fc` is absent, the `,{static_ip:"172.30.0.1",…}` literal survives, or any wlan lock remains, and runs `node --check` when `node` is on PATH (sudo usually drops nvm's PATH — `sudo -E env PATH=$PATH …` to keep it).
 - Interface renaming done in canbusprocess service (NOT udev PROGRAM — `ip link show` is unreliable in udev context)
 - Systemd ExecStart must not use `${VAR##pattern}` syntax — systemd strips `${...}` before bash sees it
 - `patcher_win` (the no-WSL path) writes partitions directly, and three of its primitives were silently wrong until they were exercised end-to-end against Beta 14. Re-check these if that code is touched: FAT lookups must be case-insensitive (pyfatfs reports 8.3 entries upper-cased, so `/config.txt` misses `CONFIG.TXT`); pyfatfs closes the stream handed to it, so the buffer must survive `close()` for the write-back; and `debugfs` needs `set_inode_field <path> mode 0100644` (with the S_IFREG bits) plus a guard against `mkdir` on paths that already exist, or the result is a filesystem that fails `e2fsck` and throws EIO on readdir. Validate any change with `e2fsck -fn` on the extracted rootfs — the patcher's own `--validate` passed on an image the kernel refused to read.
 - Upstream ships `limelight_canbusprocess.service` as `Type=oneshot`/`RemainAfterExit=yes` (Beta 14). Our drop-in's ExecStart never returns and sets `Restart=always`, which systemd refuses on a oneshot unit ("isn't allowed for Type=oneshot services. Refusing.") — so the drop-in also sets `Type=simple`/`RemainAfterExit=no`. Check drop-ins against a new release with `systemd-analyze verify <unit>` before flashing.
-- Upstream `robot.service` (Beta 14) waits up to 15s for `can_s0..can_s4` to be `state UP` and starts anyway on timeout; our override replaces that ExecStartPre with a 30s wait
+- Upstream `robot.service` (Beta 14) waits up to 15s for `can_s0..can_s4` to be `state UP` and starts anyway on timeout; our override replaces that ExecStartPre with a 30s wait for all five `/sys/class/net/can_s0..can_s4` to **exist** (a vcan placeholder is `state UNKNOWN` and never comes UP, so upstream's UP test would always burn the full timeout), then starts regardless
+- Physical CAN interfaces are brought up with `restart-ms 1000` so a bus-off adapter auto-recovers; the vcan placeholders are created after that and never get CAN link settings
 - Upstream `70-can-interface-names.rules` names the carrier board's SPI CAN controllers (`spi2.0` → `can_s0`, etc.). It never matches on Pi 5B since the SPI overlays are commented out, so it doesn't conflict with `90-usb-can-rename.rules`.
 
 ## USB cameras require a USB hub (confirmed on hardware)
@@ -233,19 +253,23 @@ sudo journalctl -u robot.service -n 50 --no-pager
 | Symptom (journal line) | Cause | Fix |
 | --- | --- | --- |
 | `ioctl(SIOCGIFINDEX) for CAN can_sN failed with No such device` then `Failed to initialize. Terminating` | Slot `can_sN` is missing from `/sys/class/net/` (fewer than 5 USB CAN adapters and the vcan-placeholder logic isn't running) | `sudo modprobe vcan && sudo ip link add dev can_sN type vcan && sudo ip link set can_sN up` for each missing N. If a service is deleting them, check `/etc/udev/rules.d/90-usb-can-rename.rules` — must include `SUBSYSTEMS=="usb"`, else `ip link add` of a vcan re-triggers canbusprocess which has a "delete CAN interfaces without `device/driver`" cleanup that wipes the vcan you just made. |
-| `Error: Waiting for server ready failed. Restarting app and retrying...` then `terminate called without an active exception` and `Aborted (core dumped)` (exit 134) | `MrcCommDaemon` isn't setting `/Netcomm/Control/ServerReady` in NT4 — almost always because it's crash-looping on `Failed to open control data file` | First try `sudo modprobe robot_heartbeat && sudo systemctl restart mrccomm.service` — that registers the real `/dev/mrccan/*` devices. If the module is unavailable, `sudo mkdir -p /dev/mrccan && sudo systemctl restart mrccomm.service`. For persistence: `/etc/modules-load.d/systemcore-pi5b.conf` listing `robot_heartbeat`, plus `/etc/tmpfiles.d/mrccan.conf` with `d /dev/mrccan 0755 root root -`. Note `ls -l /dev/mrccan` — if the entries are regular files rather than character devices, the module lost the race and you should delete them before reloading it. |
+| `Error: Waiting for server ready failed. Restarting app and retrying...` then `terminate called without an active exception` and `Aborted (core dumped)` (exit 134) | `MrcCommDaemon` isn't setting `/Netcomm/Control/ServerReady` in NT4 — almost always because it's crash-looping on `Failed to open control data file` | `robot_heartbeat` only loads once at least one `can_s*` exists, so bring the buses up first, then: `sudo systemctl stop mrccomm.service; sudo rm -f /dev/mrccan/*; sudo modprobe robot_heartbeat && sudo systemctl start mrccomm.service`. `CAN Sender: No CAN devices found` in dmesg means there were no `can_s*` yet — check `limelight_canbusprocess`, which does this whole sequence after its vcan loop. If the module really is unavailable, `sudo mkdir -p /dev/mrccan && sudo systemctl restart mrccomm.service` gets robot code running but with **no CAN enable heartbeat** (motors stay disabled). `ls -l /dev/mrccan`: character devices = module loaded, regular files = tmpfile fallback (delete them before reloading the module). |
 | `Failed to initialize can buses` for `can_d2` (not `can_s2`) | Both `can_s*` AND `can_d*` are probed by the HAL. `can_d0..can_d19` are typically created by stock SystemCore-OS init; if they're missing the image is broken — don't rename `can_d*` interfaces away. | Reboot to let stock init recreate them, or `sudo modprobe vcan && for i in $(seq 0 19); do sudo ip link add dev can_d$i type vcan; sudo ip link set can_d$i up; done` |
 
 ## Dev environment
 
 - Host: WSL2 on Windows (Ubuntu/Debian)
 - Target: Raspberry Pi 5 Model B (BCM2712), ARM64
-- SystemCore version: 2027.0.0 Beta 14 (limelightosr-2027.0.0-beta14-201)
+- SystemCore version: 2027.0.0 Beta 14 (limelightosr-2027.0.0-beta14-210; `-201` was deleted upstream on 2026-09-02)
 - Confirmed on hardware (Pi 5B, Beta 14 image built by this repo, Aug 2026): boots from SD;
   `limelight_expandfs` grew rootfs A to 6.8G (5.1G free); two USB-CAN adapters enumerate on
   `1-1`/`1-2`; RP2350 present as `cafe:4011` on `3-2`; USB camera works once behind a hub.
-  Still unverified: whether `robot_heartbeat` wins the race for `/dev/mrccan` (check
-  `ls -l /dev/mrccan` — character devices = module won, regular files = tmpfile fallback).
+  That image (v1, build 201) loaded `robot_heartbeat` too early to work — see patch 9.
+  Unverified on hardware: the v2 image (build 210) as a whole, and specifically that
+  `robot_heartbeat` now loads from the canbusprocess tail (`ls -l /dev/mrccan` — character
+  devices = module loaded, regular files = tmpfile fallback; `journalctl -u
+  limelight_canbusprocess | grep heartbeat`) and that the CAN enable heartbeat reaches
+  motor controllers.
 - Test Pi: `ssh systemcore@172.30.0.1` (password: systemcore) — the wlan0 AP address, reachable
   when the host is joined to the Pi's access point. Older notes list 10.0.0.167/10.0.0.169;
   those were LAN leases and are stale.
@@ -253,3 +277,7 @@ sudo journalctl -u robot.service -n 50 --no-pager
 ## Network boot (for development)
 
 WSL2 serves TFTP + NFS to Pi 5 over the LAN. Requires mirrored networking mode in `.wslconfig`. Run `netboot/setup-netboot.sh` to configure, then set Pi EEPROM boot order to `0xf21`.
+
+**Dead as of build 210**: that kernel moved the NFS client from built-in to a module and
+dropped `nfsroot=`/`Root-NFS` support entirely, so `root=/dev/nfs` cannot mount without an
+initramfs. Netboot still works with Beta 10-13 / `beta14-201` kernels; for 210+, flash SD.

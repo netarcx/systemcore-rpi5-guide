@@ -10,19 +10,26 @@ cd systemcore-rpi5-guide
 sudo ./build-image.sh
 ```
 
-This produces `systemcore-pi5b-2027.0.0-beta14-v1.img` — flash it to an SD card and boot:
+This produces `systemcore-pi5b-2027.0.0-beta14-v2.img` — flash it to an SD card and boot:
 
 ```bash
-sudo dd if=systemcore-pi5b-2027.0.0-beta14-v1.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v2.img of=/dev/sdX bs=4M status=progress
 ```
 
 Insert the SD card into your Pi 5 and power on. No further configuration needed.
 On first boot the stock `limelight_expandfs` service grows rootfs A to 7 GiB and
 creates the (empty) B slot — that's upstream behavior, not something this project adds.
 
+Robot code for this image needs **WPILib 2027 Alpha 7 or newer** — that's an
+upstream requirement of SystemCore build `beta14-210`, and the HAL ships with the
+robot program, not with the image.
+
 To build against a different upstream release, edit `RELEASE_TAG` / `RELEASE_NAME`
 at the top of `build-image.sh`, or just point `patch-image.py` at any downloaded
-image (see below).
+image (see below). The download is cached per release tag under
+`cache/<RELEASE_TAG>/`: upstream reuses zip filenames when it rebuilds a release
+(`beta14-201` was deleted and replaced by `beta14-210` under the same filename),
+so a name-keyed cache would keep serving the old image after a tag bump.
 
 ## Patching new upstream releases (`patch-image.py`)
 
@@ -66,7 +73,9 @@ sudo python3 patch-image.py [input.img] [options]
   --keep-mounted            Don't unmount partitions on success
   --no-cleanup-on-error     Leave mounts open if a patch fails (for debugging)
   --skip-b                  Patch A partitions only, skip B
-  --validate                Re-mount the output and verify expected files
+  --validate                Re-mount the output, verify expected files + the
+                            dashboard patches (and `node --check` the bundle
+                            when node is on PATH)
   --inspect                 Mount partitions, print paths, wait for ENTER
   --show-partitions         Print partition layout and exit
   --image-type TYPE         Force image family: auto (default), ab, or alpha
@@ -105,9 +114,9 @@ Each path has a Browse button if the default isn't right.
 - `USB-CAN udev rule` — install `90-usb-can-rename.rules` (scoped to USB so vcan placeholders don't trigger restart loops)
 - `canbusprocess override (vcan placeholders)` — install the override that names USB-CAN adapters and fills any missing `can_s0..can_s4` slot with a vcan interface (HAL requires all 5)
 - `canbuswatchdog override` — install watchdog override that waits for any `can_s*` instead of requiring all 5
-- `robot.service override` — 30-second CAN wait then start regardless
-- `/dev/mrccan tmpfile (MrcCommDaemon fix)` — install `tmpfiles.d/mrccan.conf` so `MrcCommDaemon` can write its control files at boot (without this the robot program SIGABRTs ~10s after start)
-- `Load robot_heartbeat + i2c-dev at boot` — install `modules-load.d/systemcore-pi5b.conf`. `robot_heartbeat` registers the real `/dev/mrccan/*` devices; upstream loads it from the CAN service ExecStart this project overrides
+- `robot.service override` — wait up to 30s for all of `can_s0..can_s4` to exist, then start regardless
+- `/dev/mrccan tmpfile (MrcCommDaemon fallback)` — install `tmpfiles.d/mrccan.conf` so `MrcCommDaemon` can create its control files even when `robot_heartbeat` didn't load (without either, the robot program SIGABRTs ~10s after start)
+- `Load i2c-dev at boot` — install `modules-load.d/systemcore-pi5b.conf`. `robot_heartbeat` is *not* loaded here: it needs a `can_s*` interface to exist first, so the canbusprocess override loads it after the buses are up
 - `Wireless regulatory database` — install `regulatory.db` so WiFi works on the US regdom
 - `Dashboard: unlock WLAN0 AP` — patch the minified React JS to allow editing Access Point network config
 - `Dashboard: fault count reset button` — add a "Reset Fault Counts" button to the fault tooltip in the header
@@ -121,7 +130,7 @@ Hover any checkbox for a tooltip explaining what that patch does.
 - `Keep mounted after` — leave the partition loop-mounts open on success so you can poke around with a file manager or shell. Cleanup is your problem.
 - `No cleanup on error` — leave the loop-mounts open if a patch fails, so you can inspect partial state. Use for diagnosing why a patch broke.
 - `Patch A only (skip B)` — only patches the A boot+rootfs, leaves B alone. Useful when testing a patch against just one boot slot.
-- `Validate after patch` — re-mount the output image and verify the expected files (override.conf paths, tmpfile config, flash-pico.sh) are present in every rootfs slot the image actually contains.
+- `Validate after patch` — re-mount the output image and verify the expected files (override.conf paths, tmpfile config, flash-pico.sh) are present in every rootfs slot the image actually contains, plus that the dashboard bundle really carries its four patches (a regex that goes stale after an upstream re-minify leaves the file looking untouched).
 
 **6. Action buttons:**
 - `Patch image` — apply all enabled patches. Disabled while a job is running.
@@ -194,6 +203,11 @@ The build script replaces it with `flash-pico.sh` via a systemd override. This s
 - Works with RP2350 Picos (RP2040 not supported — firmware is RP2350-specific)
 - After flashing, the Pico appears as `cafe:4011` ("Limelight RT Subsystem")
 
+Build 210 moved this unit ahead of the rest of boot (`DefaultDependencies=no`,
+`After=local-fs.target systemd-udevd.service`). The override only changes `ExecStart`, and
+`flash-pico.sh` needs nothing but `udevadm`, `dd` and `/dev/sd*` — all available that
+early — so it runs fine there.
+
 ### Multi-adapter USB-CAN support (optional)
 
 The stock image expects 5 SPI CAN interfaces (`can_s0` through `can_s4`). The build script adds support for any number of USB-to-CAN adapters:
@@ -204,7 +218,8 @@ The stock image expects 5 SPI CAN interfaces (`can_s0` through `can_s4`). The bu
 - **Discovery frame** — `cansend 000#00` sent on each bus after interface up
 - **Hot-plug** — plugging in a new adapter triggers automatic naming and configuration
 - **vcan placeholders auto-fill missing buses** — the WPILib HAL iterates `can_s0` through `can_s4` and aborts the robot program if any are missing (`ioctl(SIOCGIFINDEX) for CAN can_sN failed with No such device` → `Failed to initialize. Terminating`). After USB-CAN setup, the service creates vcan interfaces for whichever slots have no physical adapter, so 0–4 USB adapters all work.
-- **canbuswatchdog/robot.service overrides** — wait for any CAN adapter, start regardless after 30s
+- **Bus-off recovery** — physical adapters are configured with `restart-ms 1000`, so a controller that goes bus-off comes back on its own
+- **canbuswatchdog/robot.service overrides** — the watchdog waits for any `can_s*`; `robot.service` waits up to 30s for all five `can_s0..can_s4` to exist (vcan placeholders report `state UNKNOWN` and never come UP, so existence is the only workable test), then starts regardless
 
 If no CAN adapter is plugged in, all services time out gracefully and the robot starts anyway (vcan placeholders satisfy the HAL).
 
@@ -214,12 +229,27 @@ Compatible with any SocketCAN-supported USB adapter (candleLight/canable, PEAK, 
 
 `MrcCommDaemon` is the userspace service that sets the NetworkTables key `/Netcomm/Control/ServerReady`. The WPILib HAL waits on this key during robot startup — if `MrcCommDaemon` isn't running, the Java robot program SIGABRTs ~10 seconds after launch with `Error: Waiting for server ready failed. Restarting app and retrying...` and `terminate called without an active exception`.
 
-The daemon writes its state to `/dev/mrccan/controldata` and `/dev/mrccan/matchinfo`. Those are misc devices registered by the `robot_heartbeat` kernel module (which pulls in `can_sender`) — both ship in the image and are plain software modules, so they load fine on a Pi 5B. The catch: upstream only loads them from the tail of `limelight_canbusprocess.service`'s ExecStart, which this project replaces wholesale to drive USB-CAN adapters. Without the modprobe the devices never appear and the daemon crash-loops with `Failed to open control data file`.
+The daemon writes its state to `/dev/mrccan/controldata` and `/dev/mrccan/matchinfo`. Those are misc devices registered by the `robot_heartbeat` kernel module (which pulls in `can_sender`) — both ship in the image and are plain software modules, so they load fine on a Pi 5B. The catch: upstream only loads them from the tail of `limelight_canbusprocess.service`'s ExecStart, which this project replaces wholesale to drive USB-CAN adapters.
 
-So the build does both:
+**Load order matters.** `can_sender` enumerates `can_s*` netdevs in its module init and
+refuses to load with `CAN Sender: No CAN devices found` when there are none — so loading
+`robot_heartbeat` from `modules-load.d` (sysinit, long before any adapter is named) is a
+silent no-op, and it snapshots whichever buses exist at load time. The canbusprocess
+override therefore loads it *last*, after the USB-CAN adapters are configured and the vcan
+placeholders are in place:
 
-- installs `/etc/modules-load.d/systemcore-pi5b.conf` (`robot_heartbeat`, `i2c-dev`) so the devices are registered early in boot, before `mrccomm.service` starts
-- keeps `/etc/tmpfiles.d/mrccan.conf` as a fallback — with the bare `/dev/mrccan/` directory present, the daemon creates plain files there and still publishes `ServerReady`
+1. stop `mrccomm.service` (its open file descriptors would block a module reload)
+2. `rmmod robot_heartbeat` / `rmmod can_sender`, and delete any *regular* files left on
+   `/dev/mrccan/*` by an earlier fallback run
+3. `modprobe robot_heartbeat`, which registers the real character devices
+4. start `mrccomm.service` again
+
+`/etc/tmpfiles.d/mrccan.conf` stays as the fallback — with the bare `/dev/mrccan/`
+directory present, the daemon creates plain files there and still publishes `ServerReady`,
+so the robot program starts. But the enable **heartbeat on the CAN bus comes from the
+module**, so with only the fallback in play the motors never enable. `ls -l /dev/mrccan`
+tells you which you got: character devices mean the module is loaded, regular files mean
+the fallback.
 
 ### Dashboard patches
 
@@ -227,6 +257,13 @@ The build script patches the Limelight dashboard (minified React JS) to:
 
 - **Unlock WLAN0 AP settings** — the stock dashboard disables editing Access Point network config. The patch removes the disabled flag and the forced IP/gateway overrides on save.
 - **Fault count reset button** — adds a "Reset Fault Counts" button to the fault tooltip in the header. Uses a frontend-only baseline offset (no backend changes needed for the closed-source `diagnosticsprocess`).
+
+Every minified identifier these patches touch (the jsx-runtime alias, the `wlan0` and
+"form is busy" locals) is read back out of the bundle rather than hardcoded, because
+upstream re-minifies on every build — `beta14-201`'s `disabled:o||a` became
+`disabled:s||o` in `beta14-210`, which silently matched nothing. `--validate` now checks
+the bundle for all four patches (and runs `node --check` on it when `node` is on PATH),
+so that failure mode can't pass unnoticed again.
 
 ### Wireless regulatory database
 
@@ -237,6 +274,12 @@ The stock image is missing `regulatory.db`. The build script installs the US reg
 - **RP2350 firmware faults** — After flashing, the Pico firmware reports faults for hardware it expects on the carrier board (BROWNOUT, IMU, DISPLAY, CAN, RSL). These are cosmetic — USB communication works fine. The firmware is closed-source so these cannot be fixed. Use the "Reset Fault Counts" button to clear them.
 - **RP2040 not supported** — `fw.uf2` is RP2350-specific. An RP2040 Pico will accept the copy but reboot back to BOOTSEL in a loop.
 - **USB gadget mode** — The `dwc2` overlay behavior may differ between CM5 and Pi 5B.
+- **wlan0 DHCP moved** — as of build 210, `dnsmasqwifi.service` lost its `[Install]`
+  section and wifi DHCP is started from `/etc/dhcpcd.exit-hook` instead. Nothing here
+  patches it, but `systemctl status dnsmasqwifi` looking "dead" is now normal — check the
+  exit hook, not the unit.
+- **Netboot needs a pre-210 kernel** — the 210 kernel has no in-kernel NFS root support
+  (see [Network boot](#network-boot-development)).
 
 ## Project layout
 
@@ -245,6 +288,7 @@ build-image.sh          - End-to-end image builder (run with sudo)
 patch-image.py          - Standalone patcher for new upstream releases (GUI + CLI)
 patcher/                - Python package for patch-image.py
   core.py               - Mount + per-patch logic + orchestrator
+  dashboard.py          - Dashboard JS transforms (shared with the Windows patcher)
   gui.py                - Tkinter GUI
   cli.py                - argparse entry point
   resources/            - Drop-in files installed into the rootfs
@@ -263,8 +307,8 @@ netboot/                - Network boot setup (development/debugging)
 
 Files not tracked in git (generated/downloaded):
 ```
-cache/                            - Downloaded upstream image zip
-systemcore-pi5b-2027.0.0-beta14-v1.img   - Output image (~2.2GB, expands to 14GB on first boot)
+cache/<release-tag>/              - Downloaded upstream image zip, keyed by release tag
+systemcore-pi5b-2027.0.0-beta14-v2.img   - Output image (~2.2GB, expands to 14GB on first boot)
 netboot/tftpboot/                 - TFTP boot files (kernel, DTBs, overlays)
 netboot/nfsroot/                  - NFS root mount point
 ```
@@ -279,6 +323,11 @@ sudo ./netboot/setup-netboot.sh
 
 This installs `tftpd-hpa` and `nfs-kernel-server`, configures exports, and prints Pi 5 EEPROM settings. WSL2 must use **mirrored networking** mode (set `networkingMode=mirrored` in `%USERPROFILE%\.wslconfig`).
 
+**Not usable with the `beta14-210` kernel.** That kernel builds the NFS client as a module
+and drops the `nfsroot=` / `Root-NFS` in-kernel mount code entirely, so `root=/dev/nfs` can
+never come up without an initramfs. Netboot still works with earlier kernels (Beta 10-13,
+`beta14-201`); for 210 and later, flash the SD card.
+
 ## Prerequisites
 
 - Linux host for building (Ubuntu/Debian, WSL2 works)
@@ -289,8 +338,10 @@ This installs `tftpd-hpa` and `nfs-kernel-server`, configures exports, and print
 ## Tested on
 
 - Raspberry Pi 5 Model B (4GB/8GB)
-- SystemCore 2027.0.0 Beta 14 (`limelightosr-2027.0.0-beta14-201`) and Alpha 14
-  (`limelightosr-2027.0.0-alpha14-371`) — both ship the same partition layout and patch identically
+- SystemCore 2027.0.0 Beta 14 (`limelightosr-2027.0.0-beta14-210`) and Alpha 14
+  (`limelightosr-2027.0.0-alpha14-380`) — both ship the same partition layout, the same
+  dashboard bundle, and patch identically. Build 210 requires **WPILib 2027 Alpha 7** in
+  the robot program; it replaced the deleted `beta14-201` release.
 - Also supports Beta 10-13 and the older Alpha 2-10 single-boot-partition layout
 - Kernel: stock upstream 16K-page kernel, 6.12.77 (works on Pi 5B as-is since Beta 10)
 - Host: WSL2 on Windows 11

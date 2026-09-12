@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import subprocess
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -22,6 +23,15 @@ from .partition import ImageLayout, Partition, detect_layout
 from .fat import FatPartition
 from .ext4 import Ext4Partition, _find_debugfs
 from .deb import extract_deb_data
+
+# The dashboard transforms are shared verbatim with the Linux patcher so the
+# two can't drift; patcher/ has to be next to patcher_win/ anyway (RESOURCES).
+try:
+    from patcher import dashboard
+except ImportError:  # launched from inside patcher_win/, project root not on path
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from patcher import dashboard
 
 
 # ---------------------------------------------------------------------------
@@ -112,11 +122,11 @@ PATCH_DESCRIPTIONS: dict[str, str] = {
     "update_cmdline": "Add panic=0 and cfg80211.ieee80211_regdom=US to cmdline.txt",
     "install_flash_pico": "Install flash-pico.sh + picoflasherprocess override",
     "install_can_udev": "Install 90-usb-can-rename.rules (USB-only trigger)",
-    "install_canbusprocess": "Install canbusprocess override with vcan placeholders",
+    "install_canbusprocess": "Install canbusprocess override (vcan placeholders + heartbeat)",
     "install_canbuswatchdog": "Install canbuswatchdog override (waits for any can_s*)",
-    "install_robot_override": "Install robot.service override (30s CAN wait, optional)",
-    "install_mrccan": "Install /etc/tmpfiles.d/mrccan.conf (unblocks MrcCommDaemon)",
-    "install_modules_load": "Load robot_heartbeat + i2c-dev at boot (creates /dev/mrccan/*)",
+    "install_robot_override": "Install robot.service override (30s wait for can_s0..s4)",
+    "install_mrccan": "Install /etc/tmpfiles.d/mrccan.conf (MrcCommDaemon fallback)",
+    "install_modules_load": "Load i2c-dev at boot (robot_heartbeat comes from canbusprocess)",
     "install_regdb": "Install wireless-regdb so WiFi works on US regulatory domain",
     "patch_dashboard_wlan": "Unlock WLAN0 AP settings in the dashboard JS",
     "patch_dashboard_faults": "Add a 'Reset Fault Counts' button to the dashboard",
@@ -278,101 +288,83 @@ def _install_regdb(ext4: Ext4Partition, deb: Path, log: logging.Logger, label: s
             log.warning("[%s] No firmware directory found in .deb", label)
 
 
+def _find_dashboard_js(ext4: Ext4Partition) -> Optional[str]:
+    """Path of the dashboard bundle inside the rootfs, or None."""
+    out = ext4._run_debugfs([f"ls {DASHBOARD_JS_DIR}"])
+    matches = sorted(set(re.findall(r"main\.[a-f0-9]+\.js", out)))
+    return f"{DASHBOARD_JS_DIR}/{matches[0]}" if matches else None
+
+
+DASHBOARD_JS_DIR = "/var/www/html/static/js"
+
+
 def _patch_dashboard(ext4: Ext4Partition, opts: PatchOptions,
                      log: logging.Logger, label: str) -> None:
-    """Read dashboard JS, apply regex patches, write back."""
-    js_dir = "/var/www/html/static/js"
-
-    # List the js directory to find main.*.js
-    # Use debugfs ls to find the file
-    out = ext4._run_debugfs([f"ls {js_dir}"])
-    matches = re.findall(r"main\.[a-f0-9]+\.js", out)
-    if not matches:
+    """Read dashboard JS, apply the shared patches, write back."""
+    js_path = _find_dashboard_js(ext4)
+    if js_path is None:
         log.warning("[%s] Dashboard main.*.js not found, skipping", label)
         return
-
-    js_name = matches[0]
-    js_path = f"{js_dir}/{js_name}"
-    log.info("[%s] Patching dashboard: %s", label, js_name)
+    log.info("[%s] Patching dashboard: %s", label, js_path.rsplit("/", 1)[-1])
 
     if opts.dry_run:
         return
 
     content = ext4.read_text(js_path)
-
-    if opts.patch_dashboard_wlan:
-        content, _ = _sed(content, r"disabled:o\|\|a", "disabled:o", log)
-        content, _ = _sed(
-            content,
-            r',\{static_ip:"172\.30\.0\.1",gateway:"172\.30\.0\.1",use_dhcp:!1\}',
-            ",{}",
-            log,
-        )
-
-    if opts.patch_dashboard_faults:
-        content, _ = _sed(
-            content,
-            r"faultCounts:t\.fc\|\|\[0,0,0,0,0,0\]",
-            "faultCounts:(window.__rawFC=t.fc||[0,0,0,0,0,0]).map(function(v,j){"
-            "return Math.max(0,v-((window.__faultBL||[])[j]||0))})",
-            log,
-        )
-        content = _inject_fault_reset_button(content, log, label)
-
-    ext4.write_text(js_path, content)
-
-
-# Marker used to make the fault-button injection idempotent.
-FAULT_RESET_MARKER = "window.__faultBL=window.__rawFC"
-
-# End of the historical fault list — the `]` closes the tooltip's children
-# array, which is where the button gets appended.
-FAULT_LIST_TAIL_RE = r'"historical-"\.concat\(t\)\)\}\)\)\]'
-
-# The bundler minifies the react/jsx-runtime import to a different name in
-# every build ("xo" in Beta 10, "bo" in Beta 14), so the alias has to be read
-# out of the surrounding code rather than hardcoded — the injected markup
-# throws a ReferenceError and blanks the dashboard if it names the wrong one.
-JSX_ALIAS_RE = r"\(0,(\w+)\.jsx\)"
-
-
-def _inject_fault_reset_button(content: str, log: logging.Logger,
-                               label: str) -> str:
-    """Append a "Reset Fault Counts" button to the dashboard fault tooltip."""
-    if FAULT_RESET_MARKER in content:
-        log.info("[%s] Fault reset button already present, skipping", label)
-        return content
-
-    m = re.search(FAULT_LIST_TAIL_RE, content)
-    if not m:
-        log.warning("[%s] Fault history list not found — dashboard layout changed "
-                    "upstream; skipping fault reset button", label)
-        return content
-
-    # The nearest jsx() call before the list is the one rendering it.
-    aliases = re.findall(JSX_ALIAS_RE, content[max(0, m.start() - 500):m.start()])
-    if not aliases:
-        log.warning("[%s] Could not determine the jsx alias near the fault list; "
-                    "skipping fault reset button", label)
-        return content
-
-    jsx = aliases[-1]
-    button = (
-        f'"historical-".concat(t))}})),'
-        f'(0,{jsx}.jsx)("div",{{style:{{marginTop:"8px",textAlign:"center"}},'
-        f'children:(0,{jsx}.jsx)("button",{{onClick:function(){{'
-        f'{FAULT_RESET_MARKER}?window.__rawFC.slice():[]}},'
-        f'style:{{fontSize:"11px",padding:"2px 8px",cursor:"pointer",'
-        f'background:"#333",color:"#fff",border:"1px solid #666",'
-        f'borderRadius:"3px"}},children:"Reset Fault Counts"}})}})]'
+    patched = dashboard.apply_patches(
+        content, log, label,
+        wlan=opts.patch_dashboard_wlan,
+        faults=opts.patch_dashboard_faults,
     )
-    log.info("[%s] Injecting fault reset button (jsx alias: %s)", label, jsx)
-    return content[:m.start()] + button + content[m.end():]
+    if patched == content:
+        log.info("[%s] Dashboard unchanged", label)
+        return
+    ext4.write_text(js_path, patched)
 
 
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+
+
+def _validate_dashboard(ext4: Ext4Partition, log: logging.Logger,
+                        label: str) -> list[str]:
+    """Check the dashboard bundle actually carries the patches — a stale regex
+    leaves the file present but unpatched, which file checks can't see."""
+    js_path = _find_dashboard_js(ext4)
+    if js_path is None:
+        return [f"[{label}] dashboard main.*.js not found"]
+    name = js_path.rsplit("/", 1)[-1]
+    text = ext4.read_text(js_path)
+    problems = [f"[{label}] dashboard {name}: {p}"
+                for p in dashboard.check_patched(text)]
+    if not problems:
+        log.info("[%s] ok: dashboard %s (AP unlocked, fault reset button, "
+                 "fault baseline)", label, name)
+
+    node = shutil.which("node")
+    if node:
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                         encoding="utf-8",
+                                         errors="surrogateescape") as fh:
+            fh.write(text)
+            tmp = fh.name
+        try:
+            res = subprocess.run([node, "--check", tmp],
+                                 capture_output=True, text=True)
+            if res.returncode != 0:
+                first = res.stderr.strip().splitlines()
+                problems.append(f"[{label}] dashboard {name}: node --check "
+                                f"failed: {first[0] if first else ''}")
+            else:
+                log.info("[%s] ok: dashboard %s parses (node --check)", label, name)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+    else:
+        log.info("[%s] node not on PATH, skipping syntax check of %s "
+                 "(sudo drops nvm's PATH — re-run with `sudo -E env PATH=$PATH` "
+                 "to enable it)", label, name)
+    return problems
 
 
 def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
@@ -397,6 +389,7 @@ def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
                     problems.append(f"[{label}] missing: {rel}")
                 else:
                     log.debug("[%s] ok: %s", label, rel)
+            problems += _validate_dashboard(ext4, log, label)
 
     if not problems:
         log.info("Validation passed")

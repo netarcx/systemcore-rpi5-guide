@@ -6,7 +6,7 @@
 # patcher/ and patcher/resources/ so there is exactly one copy of each.
 set -euo pipefail
 
-PI5B_VERSION="v1"
+PI5B_VERSION="v2"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -14,12 +14,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # layout since Alpha 11 and patch identically — to build from an alpha release
 # instead, change the tag/name below and swap IMAGE_ZIP_NAME's prefix to
 # "limelightsystemcorecm5-".
-RELEASE_TAG="limelightosr-2027.0.0-beta14-201"
+RELEASE_TAG="limelightosr-2027.0.0-beta14-210"
 RELEASE_NAME="limelightosr-2027.0.0-beta14"
 IMAGE_ZIP_NAME="limelightsystemcorebetacm5-${RELEASE_NAME}.zip"
 IMAGE_URL="https://github.com/LimelightVision/systemcore-os-public/releases/download/${RELEASE_TAG}/${IMAGE_ZIP_NAME}"
 
-IMAGE_ZIP="${SCRIPT_DIR}/cache/${IMAGE_ZIP_NAME}"
+# Cache per release TAG, not per zip name: upstream reuses the zip name across
+# rebuilds of the same release (beta14-201 was deleted and replaced by
+# beta14-210 with an identical filename), so a name-keyed cache would serve a
+# stale image forever after a tag bump.
+IMAGE_ZIP="${SCRIPT_DIR}/cache/${RELEASE_TAG}/${IMAGE_ZIP_NAME}"
 OUTPUT_IMG="${SCRIPT_DIR}/systemcore-pi5b-${RELEASE_NAME#limelightosr-}-${PI5B_VERSION}.img"
 
 # --- Step 1: Preflight ---
@@ -48,7 +52,7 @@ echo ""
 # NOTE: Beta 10+ ships a 16K-page kernel with matching userspace, and the boot
 # partitions ship a Pi 5 Model B device tree. We no longer replace either.
 
-mkdir -p "${SCRIPT_DIR}/cache"
+mkdir -p "$(dirname "$IMAGE_ZIP")"
 
 if [ ! -f "$IMAGE_ZIP" ]; then
     echo "[1/3] Downloading upstream SystemCore image (${RELEASE_NAME})..."
@@ -87,8 +91,10 @@ echo "    - USB-CAN multi-adapter support (can_s0-s4, CAN FD 1Mbps/5Mbps)"
 echo "    - vcan placeholders auto-fill missing can_s0-s4 (HAL requires all 5)"
 echo "    - CAN is optional (30s timeout, robot starts regardless)"
 echo "    - Hot-plug: new adapters auto-named and configured"
-echo "    - /dev/mrccan tmpfile (unblocks MrcCommDaemon -> robot.service)"
-echo "    - robot_heartbeat + i2c-dev loaded at boot (creates /dev/mrccan/*)"
+echo "    - robot_heartbeat loaded after the buses exist, then mrccomm restarted"
+echo "      (creates the real /dev/mrccan/* + the CAN enable heartbeat)"
+echo "    - /dev/mrccan tmpfile fallback (unblocks MrcCommDaemon -> robot.service)"
+echo "    - i2c-dev loaded at boot"
 echo "    - Wireless regulatory database (US WiFi channels, if not already present)"
 echo "    - Dashboard: WLAN0 AP settings unlocked, fault count reset button"
 echo ""
