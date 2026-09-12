@@ -65,6 +65,8 @@ patcher/              - Python package backing patch-image.py
   resources/          - Drop-in service overrides + udev rules + tmpfile/modules-load configs
     camera-shim/      - realpath() LD_PRELOAD shim (+ source, build.sh) that lets vision servers see a camera on a bare Pi 5B port
     alpha2/           - Pi 5B DTBs compiled from Alpha 2 kernel (6.6.45)
+examples/
+  phoenix-tuner-robot/ - Minimal WPILib+Phoenix program that brings up the Phoenix diagnostic server for Tuner X
 netboot/
   flash-pico.sh       - Pico flasher replacement (installed into image by build-image.sh)
   setup-netboot.sh    - TFTP + NFS netboot setup for WSL2 development
@@ -188,7 +190,18 @@ carries `bcm2712-rpi-5-b.dtb`, an `[all]` config.txt section, and a real `cmdlin
 
 - Phoenix / CTRE on SystemCore: the Phoenix diagnostic server that Tuner X talks to is part
   of the robot program (Phoenix 6 vendordep), so there is nothing to pre-install; Tuner X
-  needs a deployed program that constructs a Phoenix 6 device. Phoenix's default SystemCore
+  needs a deployed program that constructs a Phoenix 6 device. `examples/phoenix-tuner-robot/`
+  is that program (WPILib/GradleRIO 2027.0.0-alpha-6 + Phoenix 26.50.0-alpha-1 — no Phoenix
+  build exists for Alpha 7 yet, and an Alpha 6 program verifiably runs on build 210: HAL init,
+  NT on 5810, `[phoenix-diagnostics] Server 2026.50.0 ... running on port: 1250`, answers
+  `http://<pi>:1250/?action=getversion` with `"System":"Systemcore"`). Build with
+  `JAVA_HOME=~/wpilib/2027/jdk` (JDK 25), deploy with `./gradlew deploy -PsystemcoreHost=<ip>`
+  (GradleRIO's SystemCore target: user/password `systemcore`, jar → `/home/systemcore/wpilib/
+  classpath`, JNI libs → `/home/systemcore/wpilib/third-party/lib`, writes `robotCommand`,
+  enables+starts `robot.service`). Commands v2 in Alpha 6 throws `Default commands must
+  require their subsystem!` for `Commands.run(fn)` without a requirement — pass the subsystem.
+  The Pi's sshd (OpenSSH ≥ 9.8, `PerSourcePenalties`) answers `Not allowed at this time` for
+  ~5–10 min after a burst of connection probes (e.g. `nc -z` on port 22) — wait or reboot. Phoenix's default SystemCore
   bus is `can_s1` (`CANBus.systemCore(n)` selects `can_s<n>`). CTRE's dashboard-installable
   CANivore packages (`https://ctre.download/files/systemcore/canivore-usb-kernel_1.18_aarch64.ipk`
   + `canivore-usb_1.16_aarch64.ipk`) do not work on build 210: the module was built against an
