@@ -8,6 +8,8 @@ import org.wpilib.driverstation.DriverStation;
 import org.wpilib.framework.TimedRobot;
 import org.wpilib.system.DataLogManager;
 import org.wpilib.command2.*;
+import com.ctre.phoenix6.unmanaged.Unmanaged;
+import org.wpilib.driverstation.RobotState;
 /**
  * The methods in this class are called automatically corresponding to each mode, as described in
  * the TimedRobot documentation. If you change the name of this class or the package after creating
@@ -42,6 +44,8 @@ public class Robot extends TimedRobot {
    * <p>This runs after the mode specific periodic functions, but before LiveWindow and
    * SmartDashboard integrated updating.
    */
+  private boolean wasEnabled;
+
   @Override
   public void robotPeriodic() {
     // Runs the Scheduler.  This is responsible for polling buttons, adding newly-scheduled
@@ -49,6 +53,25 @@ public class Robot extends TimedRobot {
     // and running subsystem periodic() methods.  This must be called from the robot's periodic
     // block in order for anything in the Command-based framework to work.
     CommandScheduler.getInstance().run();
+
+    // Tell Phoenix the robot is enabled so it sends its enable frame to the devices along with
+    // the FRC heartbeat. On a roboRIO this is automatic; on the SystemCore alpha build it is
+    // fed explicitly here every loop (100 ms timeout, so devices disable if the loop stalls).
+    boolean enabled = RobotState.isEnabled();
+    if (enabled) {
+      Unmanaged.feedEnable(100);
+    }
+    if (enabled != wasEnabled) {
+      wasEnabled = enabled;
+      System.out.println("[robot] DriverStation " + (enabled ? "ENABLED" : "DISABLED") + " mode="
+          + RobotState.getRobotMode() + " phoenixEnable=" + Unmanaged.getEnableState());
+    }
+  }
+    if (enabled != wasEnabled) {
+      wasEnabled = enabled;
+      System.out.println("[robot] DriverStation " + (enabled ? "ENABLED" : "DISABLED")
+          + (enabled ? " (" + (DriverStation.isAutonomous() ? "autonomous" : DriverStation.isTest() ? "test" : "teleop") + "), feeding Phoenix enable" : ""));
+    }
   }
 
   /** This function is called once each time the robot enters Disabled mode. */
