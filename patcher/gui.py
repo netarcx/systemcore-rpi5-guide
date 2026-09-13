@@ -66,6 +66,7 @@ class PatcherGUI:
         ("install_mrccan", "/dev/mrccan tmpfile (MrcCommDaemon fallback)"),
         ("install_modules_load", "Load i2c-dev at boot"),
         ("install_camera_shim", "Camera on a bare Pi 5B USB port (realpath shim)"),
+        ("disable_iodaemon", "Keep iodaemon off (Pi 5B brownout blocks CAN enable)"),
         ("install_regdb", "Wireless regulatory database"),
         ("patch_dashboard_wlan", "Dashboard: unlock WLAN0 AP"),
         ("patch_dashboard_faults", "Dashboard: fault count reset button"),

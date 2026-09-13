@@ -43,6 +43,7 @@ RES_ROBOT = RESOURCES / "robot-override.conf"
 RES_PICOFLASHER = RESOURCES / "picoflasher-override.conf"
 RES_MRCCAN = RESOURCES / "mrccan.conf"
 RES_MODULES_LOAD = RESOURCES / "modules-load.conf"
+RES_IODAEMON = RESOURCES / "iodaemon-override.conf"
 RES_CAMERA_SHIM_SO = RESOURCES / "camera-shim" / "pi5b-camera-shim.so"
 RES_CAMERA_SHIM_CONF = RESOURCES / "camera-shim" / "visionserver-camera-shim.conf"
 
@@ -136,6 +137,7 @@ class PatchOptions:
     install_mrccan: bool = True
     install_modules_load: bool = True
     install_camera_shim: bool = True
+    disable_iodaemon: bool = True
     install_regdb: bool = True
     patch_dashboard_wlan: bool = True
     patch_dashboard_faults: bool = True
@@ -169,6 +171,7 @@ class PatchOptions:
             "install_mrccan",
             "install_modules_load",
             "install_camera_shim",
+            "disable_iodaemon",
             "install_regdb",
             "patch_dashboard_wlan",
             "patch_dashboard_faults",
@@ -192,6 +195,7 @@ PATCH_DESCRIPTIONS: dict[str, str] = {
     "install_mrccan": "Install /etc/tmpfiles.d/mrccan.conf (MrcCommDaemon fallback)",
     "install_modules_load": "Load i2c-dev at boot (robot_heartbeat comes from canbusprocess)",
     "install_camera_shim": "Let vision servers use a camera plugged straight into a Pi 5B port",
+    "disable_iodaemon": "Keep iodaemon off (its permanent Pi 5B brownout blocks the CAN enable heartbeat)",
     "install_regdb": "Install wireless-regdb so WiFi works on US regulatory domain",
     "patch_dashboard_wlan": "Unlock WLAN0 AP settings in the dashboard JS",
     "patch_dashboard_faults": "Add a 'Reset Fault Counts' button to the dashboard",
@@ -709,6 +713,13 @@ def patch_rootfs_partition(mount: Path, opts: PatchOptions, log: logging.Logger,
                   mount / "etc/modules-load.d/systemcore-pi5b.conf",
                   log, opts.dry_run)
 
+    if opts.disable_iodaemon:
+        # The RP2350 reports brownout forever on a Pi 5B (no battery sense), and
+        # MrcCommDaemon won't enable the CAN heartbeat while /sys/brownout is set.
+        copy_into(RES_IODAEMON,
+                  mount / "etc/systemd/system/limelight_iodaemon.service.d/20-pi5b.conf",
+                  log, opts.dry_run)
+
     if opts.install_camera_shim:
         # LD_PRELOAD wrapper around realpath() so the vision servers accept a
         # camera on a bare Pi 5B port (they only match the carrier board's
@@ -827,6 +838,7 @@ def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
                     "etc/tmpfiles.d/mrccan.conf",
                     "etc/modules-load.d/systemcore-pi5b.conf",
                     "usr/local/lib/pi5b-camera-shim.so",
+                    "etc/systemd/system/limelight_iodaemon.service.d/20-pi5b.conf",
                     "etc/systemd/system/limelight_visionserver.service.d/20-pi5b-camera.conf",
                     "etc/systemd/system/limelight_visionserver3.service.d/20-pi5b-camera.conf",
                     "etc/udev/rules.d/90-usb-can-rename.rules",

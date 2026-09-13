@@ -49,6 +49,7 @@ RES_ROBOT = RESOURCES / "robot-override.conf"
 RES_PICOFLASHER = RESOURCES / "picoflasher-override.conf"
 RES_MRCCAN = RESOURCES / "mrccan.conf"
 RES_MODULES_LOAD = RESOURCES / "modules-load.conf"
+RES_IODAEMON = RESOURCES / "iodaemon-override.conf"
 RES_CAMERA_SHIM_SO = RESOURCES / "camera-shim" / "pi5b-camera-shim.so"
 RES_CAMERA_SHIM_CONF = RESOURCES / "camera-shim" / "visionserver-camera-shim.conf"
 VISIONSERVER_UNITS = ("limelight_visionserver", "limelight_visionserver1",
@@ -99,6 +100,7 @@ class PatchOptions:
     install_mrccan: bool = True
     install_modules_load: bool = True
     install_camera_shim: bool = True
+    disable_iodaemon: bool = True
     install_regdb: bool = True
     patch_dashboard_wlan: bool = True
     patch_dashboard_faults: bool = True
@@ -116,7 +118,7 @@ class PatchOptions:
             "install_flash_pico", "install_can_udev",
             "install_canbusprocess", "install_canbuswatchdog",
             "install_robot_override", "install_mrccan", "install_modules_load",
-            "install_camera_shim",
+            "install_camera_shim", "disable_iodaemon",
             "install_regdb",
             "patch_dashboard_wlan", "patch_dashboard_faults",
         ]
@@ -134,6 +136,7 @@ PATCH_DESCRIPTIONS: dict[str, str] = {
     "install_mrccan": "Install /etc/tmpfiles.d/mrccan.conf (MrcCommDaemon fallback)",
     "install_modules_load": "Load i2c-dev at boot (robot_heartbeat comes from canbusprocess)",
     "install_camera_shim": "Let vision servers use a camera plugged straight into a Pi 5B port",
+    "disable_iodaemon": "Keep iodaemon off (its permanent Pi 5B brownout blocks the CAN enable heartbeat)",
     "install_regdb": "Install wireless-regdb so WiFi works on US regulatory domain",
     "patch_dashboard_wlan": "Unlock WLAN0 AP settings in the dashboard JS",
     "patch_dashboard_faults": "Add a 'Reset Fault Counts' button to the dashboard",
@@ -263,6 +266,12 @@ def patch_rootfs_partition(ext4: Ext4Partition, opts: PatchOptions,
         if not opts.dry_run:
             ext4.copy_file_in(RES_MODULES_LOAD,
                               "/etc/modules-load.d/systemcore-pi5b.conf")
+
+    if opts.disable_iodaemon:
+        log.info("[%s] Installing iodaemon drop-in (off unless /etc/pi5b-enable-iodaemon exists)", label)
+        if not opts.dry_run:
+            ext4.copy_file_in(RES_IODAEMON,
+                              "/etc/systemd/system/limelight_iodaemon.service.d/20-pi5b.conf")
 
     if opts.install_camera_shim:
         log.info("[%s] Installing Pi 5B camera shim + visionserver drop-ins", label)
@@ -397,6 +406,7 @@ def validate(layout: ImageLayout, log: logging.Logger) -> list[str]:
                 "/etc/tmpfiles.d/mrccan.conf",
                 "/etc/modules-load.d/systemcore-pi5b.conf",
                 "/usr/local/lib/pi5b-camera-shim.so",
+                "/etc/systemd/system/limelight_iodaemon.service.d/20-pi5b.conf",
                 "/etc/systemd/system/limelight_visionserver.service.d/20-pi5b-camera.conf",
                 "/etc/systemd/system/limelight_visionserver3.service.d/20-pi5b-camera.conf",
                 "/etc/udev/rules.d/90-usb-can-rename.rules",

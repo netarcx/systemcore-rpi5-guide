@@ -10,10 +10,10 @@ cd systemcore-rpi5-guide
 sudo ./build-image.sh
 ```
 
-This produces `systemcore-pi5b-2027.0.0-beta14-v6.img` — flash it to an SD card and boot:
+This produces `systemcore-pi5b-2027.0.0-beta14-v7.img` — flash it to an SD card and boot:
 
 ```bash
-sudo dd if=systemcore-pi5b-2027.0.0-beta14-v6.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v7.img of=/dev/sdX bs=4M status=progress
 ```
 
 Insert the SD card into your Pi 5 and power on. No further configuration needed.
@@ -288,6 +288,25 @@ upstream re-minifies on every build — `beta14-201`'s `disabled:o||a` became
 the bundle for all four patches (and runs `node --check` on it when `node` is on PATH),
 so that failure mode can't pass unnoticed again.
 
+### iodaemon kept off (brownout gate)
+
+`iodaemon` relays what the RP2350 reports — battery voltage, brownout, Smart I/O, RSL, IMU.
+On a Pi 5B the sensing behind those does not exist, so the RP2350 reports **brownout
+permanently**, and `MrcCommDaemon` treats that like a roboRIO in brownout protection: the CAN
+heartbeat never says "enabled" and every CTRE device stays `Robot Enable: Disabled` in Tuner X
+no matter what the robot program does. A drop-in keeps `limelight_iodaemon` from starting;
+`sudo touch /etc/pi5b-enable-iodaemon` turns it back on if you ever have the carrier-board
+hardware. Verified: with it off the daemon logs `Brownout: 0`, a Driver Station enable is
+honoured, and a Talon FXS enables.
+
+### CAN transmit-stall watchdog
+
+A CANable 2.5 was seen coming up with its transmit path wedged: thousands of frames received,
+four sent, Phoenix saw no devices, and because Phoenix blocked the robot loop the daemon dropped
+the program's watchdog a few seconds after every enable. Only a USB re-enumeration clears it.
+The CAN service now watches every physical adapter: if it receives bus traffic but has sent
+nothing for 6 s, the adapter is USB-reset and comes back through the normal hot-plug path.
+
 ### Camera shim
 
 Each `visionserverN` compares a camera's canonical sysfs path against one hard-coded path
@@ -321,6 +340,10 @@ Nothing Phoenix-specific is (or can be) pre-installed in the image:
 - **Bus selection** — `CANBus.systemCore(n)` picks `can_s<n>`; a device constructed without a
   bus uses Phoenix's SystemCore default, which is `can_s1`, so with a single USB-CAN adapter
   (renamed `can_s0`) pass the bus explicitly.
+- **Enabling motors** needs three things on this image, all verified together on 2026-09-13:
+  a WPILib **Alpha 7** program (build 210's daemon only honours enable while an Alpha 7 HAL
+  feeds its watchdog), `iodaemon` off (see above), and the CAN adapter actually transmitting
+  (see the watchdog above).
 - **CANivore** — CTRE's `canivore-usb-kernel_1.18` package (the dashboard-installable
   driver) was built against an earlier Beta 14 kernel and does **not** load on build 210
   (`disagrees about version of symbol module_layout`); CTRE has not published a newer
@@ -366,7 +389,7 @@ netboot/                - Network boot setup (development/debugging)
 Files not tracked in git (generated/downloaded):
 ```
 cache/<release-tag>/              - Downloaded upstream image zip, keyed by release tag
-systemcore-pi5b-2027.0.0-beta14-v6.img   - Output image (~2.2GB, expands to 14GB on first boot)
+systemcore-pi5b-2027.0.0-beta14-v7.img   - Output image (~2.2GB, expands to 14GB on first boot)
 netboot/tftpboot/                 - TFTP boot files (kernel, DTBs, overlays)
 netboot/nfsroot/                  - NFS root mount point
 ```

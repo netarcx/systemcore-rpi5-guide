@@ -45,7 +45,7 @@ Consequences for the patcher:
 ```bash
 # Build from scratch (downloads the pinned upstream release, then patches it)
 sudo ./build-image.sh
-sudo dd if=systemcore-pi5b-2027.0.0-beta14-v6.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v7.img of=/dev/sdX bs=4M status=progress
 
 # Any upstream image (Alpha or Beta, auto-detected)
 sudo python3 patch-image.py upstream.img
@@ -104,6 +104,8 @@ Not tracked in git: `cache/`, `*.img`, `*.zip`, `netboot/tftpboot/`, `netboot/nf
 12. **WLAN0 AP settings unlocked** — dashboard JS patched to allow modifying Access Point config
 13. **Fault count reset button** — frontend-only baseline reset added to fault tooltip in dashboard
 14. **Camera shim** — `LD_PRELOAD` wrapper around `realpath()` for the four vision servers so a camera plugged straight into a Pi 5B port is accepted (see the USB cameras section)
+15. **iodaemon off** — drop-in `limelight_iodaemon.service.d/20-pi5b.conf` with `ConditionPathExists=/etc/pi5b-enable-iodaemon`. On a Pi 5B the RP2350 reports **brownout permanently** (no battery sense), iodaemon publishes it, and `MrcCommDaemon` then never sets the enabled bit in the CAN heartbeat (its log shows `Brownout: 1`, and every CTRE device sits at `Robot Enable: Disabled` in Tuner X). Verified 2026-09-13: with iodaemon stopped the daemon logs `Brownout: 0` and a DS enable produces `Watchdog Enabled / Enabled: 1`, the heartbeat carries enable, and the Talon FXS enables. `sudo touch /etc/pi5b-enable-iodaemon` opts back in.
+16. **CAN TX-stall watchdog** — inside the canbusprocess monitor loop: a physical adapter whose `tx_packets` stops growing for 6 s while `rx_packets` keeps growing (the heartbeat module always transmits) is USB de/re-authorized, which runs the normal hot-plug path. Seen on a CANable 2.5 right after boot: 145k frames received, 4 sent, Phoenix saw no devices, and the blocked Phoenix calls stalled the robot loop so the daemon dropped the program's watchdog (`Watchdog Disabled`) seconds after each enable. A bus with no other node is left alone.
 
 ## Legacy-Alpha patches (auto-applied only for the Alpha 2–10 layout)
 
@@ -166,10 +168,12 @@ carries `bcm2712-rpi-5-b.dtb`, an `[all]` config.txt section, and a real `cmdlin
   `canbus_down`/`canbus_unavail` read from `can_s0..can_s4` itself) → websocket `hw` payload
   (`f` bitmask, `fc` counts) → dashboard. Bit order is
   `[BROWNOUT, I/O, RSL, USB, DISPLAY, IMU, CAN STATUS, CAN AVAIL]`, decoded as `0!==(t&1<<i)`.
-- BROWNOUT / I/O / DISPLAY / IMU (bits 0,1,4,5) are permanently faulted on a Pi 5B and are
-  cosmetic: the closed RP2350 firmware expects carrier-board circuits (battery monitor, Smart
-  I/O short detection, display, I2C IMU) that don't exist. They re-fire every poll, so the
-  counts climb ~100/s. CAN STATUS (bit 6) is **not** cosmetic — `hwmon` derives it from the
+- BROWNOUT / I/O / DISPLAY / IMU (bits 0,1,4,5) are permanently faulted on a Pi 5B because the
+  closed RP2350 firmware expects carrier-board circuits (battery monitor, Smart I/O short
+  detection, display, I2C IMU) that don't exist. They re-fire every poll, so the counts climb
+  ~100/s. **BROWNOUT is not cosmetic**: iodaemon publishes `/sys/brownout`, MrcCommDaemon
+  reads it (`Brownout: %d` in its control-data dumps) and, like a roboRIO in brownout
+  protection, refuses to enable outputs — which is why patch 15 keeps iodaemon off. CAN STATUS (bit 6) is **not** cosmetic — `hwmon` derives it from the
   real `can_s*` state, so it also fires when a USB-CAN adapter genuinely drops, and it is
   expected while most buses are vcan placeholders. Suppressing bits 0,1,4,5 means masking with
   `0xCC`; leave bit 6 visible or you lose a working diagnostic. `iodaemon` has no config or
@@ -310,11 +314,10 @@ sudo journalctl -u robot.service -n 50 --no-pager
   `1-1`/`1-2`; RP2350 present as `cafe:4011` on `3-2`; USB camera works on a bare port with the
   camera shim (v4) and behind a hub without it.
   That image (v1, build 201) loaded `robot_heartbeat` too early to work — see patch 9.
-  Unverified on hardware: the v2 image (build 210) as a whole, and specifically that
-  `robot_heartbeat` now loads from the canbusprocess tail (`ls -l /dev/mrccan` — character
-  devices = module loaded, regular files = tmpfile fallback; `journalctl -u
-  limelight_canbusprocess | grep heartbeat`) and that the CAN enable heartbeat reaches
-  motor controllers.
+  Verified 2026-09-13 with a Driver Station and the WPILib Alpha 7 example program: `ls -l
+  /dev/mrccan` shows character devices, the daemon logs `Enabled: 1 / WatchdogActive: 1 /
+  Brownout: 0` on enable, and the Talon FXS (ID 2, can_s0) shows `Robot Enable: Enabled` in
+  Tuner X. Bench bus: CANable 2.5 on `1-1`, Talon FXS 2, Pigeon 2 (7), PDP 62, CANdle 0.
 - Test Pi: `ssh systemcore@172.30.0.1` (password: systemcore) — the wlan0 AP address, reachable
   when the host is joined to the Pi's access point. Older notes list 10.0.0.167/10.0.0.169;
   those were LAN leases and are stale.
