@@ -6,7 +6,7 @@
 # patcher/ and patcher/resources/ so there is exactly one copy of each.
 set -euo pipefail
 
-PI5B_VERSION="v5"
+PI5B_VERSION="v6"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -87,7 +87,7 @@ echo "  Patches applied:"
 echo "    - HDMI output enabled"
 echo "    - SPI CAN overlays disabled (no hardware on Pi 5B)"
 echo "    - flash-pico.sh (auto-flashes RP2350 Pico on any USB port)"
-echo "    - USB-CAN multi-adapter support (can_s0-s4, CAN FD 1Mbps/5Mbps)"
+echo "    - USB-CAN multi-adapter support (can_s0-s4, classic CAN 1Mbps like stock)"
 echo "    - vcan placeholders auto-fill missing can_s0-s4 (HAL requires all 5)"
 echo "    - CAN is optional (30s timeout, robot starts regardless)"
 echo "    - Hot-plug: new adapters auto-named and configured"

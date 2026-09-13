@@ -10,10 +10,10 @@ cd systemcore-rpi5-guide
 sudo ./build-image.sh
 ```
 
-This produces `systemcore-pi5b-2027.0.0-beta14-v5.img` — flash it to an SD card and boot:
+This produces `systemcore-pi5b-2027.0.0-beta14-v6.img` — flash it to an SD card and boot:
 
 ```bash
-sudo dd if=systemcore-pi5b-2027.0.0-beta14-v5.img of=/dev/sdX bs=4M status=progress
+sudo dd if=systemcore-pi5b-2027.0.0-beta14-v6.img of=/dev/sdX bs=4M status=progress
 ```
 
 Insert the SD card into your Pi 5 and power on. No further configuration needed.
@@ -219,7 +219,7 @@ early — so it runs fine there.
 The stock image expects 5 SPI CAN interfaces (`can_s0` through `can_s4`). The build script adds support for any number of USB-to-CAN adapters:
 
 - **Udev rule** triggers the CAN service restart when an adapter is plugged in. The match is scoped to `SUBSYSTEMS=="usb"` so vcan placeholders (see below) don't re-trigger the service and cause an infinite restart loop.
-- **canbusprocess override** discovers all CAN interfaces, renames them to `can_s0`, `can_s1`, etc., configures each with CAN FD (1Mbps/5Mbps) or falls back to standard CAN (1Mbps)
+- **canbusprocess override** discovers all CAN interfaces, renames them to `can_s0`, `can_s1`, etc., and configures each as classic CAN at 1 Mbps — the same as a stock SystemCore. FRC devices on a `can_s*` bus are classic CAN; running an FD-capable adapter in FD mode made Phoenix's frames bus-off a Talon FX and Tuner X listed nothing. `sudo touch /etc/pi5b-can-fd` opts into CAN FD 1M/5M if you know you need it
 - **Persistent port mapping** — each USB port path is mapped to a stable `can_sN` index in `/etc/can_port_map`, so the same physical port always gets the same name regardless of plug order (works with USB hubs)
 - **Discovery frame** — `cansend 000#00` sent on each bus after interface up
 - **Hot-plug** — plugging in a new adapter triggers automatic naming and configuration
@@ -228,20 +228,22 @@ The stock image expects 5 SPI CAN interfaces (`can_s0` through `can_s4`). The bu
 
 If no CAN adapter is plugged in, all services time out gracefully and the robot starts anyway (vcan placeholders satisfy the HAL).
 
-Compatible with any SocketCAN-supported USB adapter (candleLight/canable, PEAK, EMS, etc.). Mixed CAN FD and standard CAN adapters work together.
+Compatible with any SocketCAN-supported USB adapter (candleLight/canable, PEAK, EMS, etc.); FD-capable and classic-only adapters can be mixed.
 
 ### Unplug / replug (verified on hardware)
 
 - **CAN adapter unplugged:** its `can_sN` disappears, the CAN service notices within ~2 s,
-  releases the heartbeat module's hold on the interface (so the kernel can finish removing
-  it), puts a vcan placeholder in that slot and reloads the heartbeat. The robot program keeps
-  running; the other buses are untouched (placeholders are never recreated needlessly, so the
-  HAL's sockets to them stay valid).
+  stops everything that holds the heartbeat device open (MrcCommDaemon, the I/O daemons and
+  the robot program — its HAL reads the enable state from `/dev/mrccan`), unloads the
+  heartbeat module so the kernel can finish removing the adapter, puts a vcan placeholder in
+  that slot, reloads the heartbeat and starts everything again. Other buses are untouched
+  (placeholders are never recreated needlessly).
 - **CAN adapter plugged back in:** the udev rule restarts the CAN service, the adapter takes
-  its remembered slot back (`/etc/can_port_map`), the heartbeat is reloaded with the real bus,
-  and `robot.service` is restarted — a re-enumerated adapter has a new interface index, so the
-  running HAL could never talk to it again otherwise. A stock SystemCore never has to deal
-  with this (its CAN controllers are soldered on), which is why upstream doesn't.
+  its remembered slot back (`/etc/can_port_map`), and the same reload cycle runs, so the
+  robot program comes back bound to the real bus — a re-enumerated adapter has a new
+  interface index, so the running HAL could never talk to it again otherwise. Expect the
+  robot program to restart (a few seconds) on every adapter change. A stock SystemCore never
+  has to deal with this (its CAN controllers are soldered on), which is why upstream doesn't.
 - **Camera unplugged / replugged:** nothing extra needed — the vision server drops the camera
   and its periodic rescan picks it up again a few seconds after it reappears, streaming
   resumes.
@@ -362,7 +364,7 @@ netboot/                - Network boot setup (development/debugging)
 Files not tracked in git (generated/downloaded):
 ```
 cache/<release-tag>/              - Downloaded upstream image zip, keyed by release tag
-systemcore-pi5b-2027.0.0-beta14-v5.img   - Output image (~2.2GB, expands to 14GB on first boot)
+systemcore-pi5b-2027.0.0-beta14-v6.img   - Output image (~2.2GB, expands to 14GB on first boot)
 netboot/tftpboot/                 - TFTP boot files (kernel, DTBs, overlays)
 netboot/nfsroot/                  - NFS root mount point
 ```
