@@ -4,59 +4,47 @@
 
 package first.robot.subsystems;
 
-import org.wpilib.command2.*;
 import com.ctre.phoenix6.CANBus;
-import com.ctre.phoenix6.configs.TalonFXConfiguration;
+import com.ctre.phoenix6.configs.MotorOutputConfigs;
+import com.ctre.phoenix6.controls.CoastOut;
 import com.ctre.phoenix6.controls.DutyCycleOut;
-import com.ctre.phoenix6.hardware.TalonFX;
-import com.ctre.phoenix6.signals.InvertedValue;
+import com.ctre.phoenix6.hardware.TalonFXS;
 import com.ctre.phoenix6.signals.NeutralModeValue;
+import org.wpilib.command2.Command;
+import org.wpilib.command2.SubsystemBase;
 
+/**
+ * One Talon FXS (CAN ID 2 on can_s0, the first USB-CAN adapter). Constructing it is what starts
+ * the Phoenix diagnostic server for Tuner X. While the robot is enabled the default command keeps
+ * the motor in coast-out (bridge disabled, shaft spins freely); the neutral mode is set to Coast
+ * too, so it also coasts when disabled.
+ *
+ * <p>Only the neutral mode is written to the device — the motor arrangement, limits and inversion
+ * configured in Tuner X are left alone (a full TalonFXSConfiguration would reset the arrangement
+ * to Disabled).
+ */
 public class TestSubsystem extends SubsystemBase {
+  private static final int TALON_ID = 2;
+  private static final int CAN_BUS = 0; // can_s0
 
-  // setup an motor
-  // One Phoenix device is enough to bring up the Phoenix diagnostic server for Tuner X.
-  // can_s0 is the first USB-CAN adapter on a Pi 5B build of SystemCore.
-  private final TalonFX motor = new TalonFX(1, CANBus.systemcore(0));
-  private DutyCycleOut request = new DutyCycleOut(0).withEnableFOC(false);
-  private final double CLOCKWISE = 0.3;
-  private final double COUNTERCLOCKWISE = -0.3;
+  private final TalonFXS motor = new TalonFXS(TALON_ID, CANBus.systemcore(CAN_BUS));
+  private final CoastOut coastOut = new CoastOut();
+  private final DutyCycleOut dutyCycle = new DutyCycleOut(0);
 
   public TestSubsystem() {
-    configureMotors();
+    var motorOutput = new MotorOutputConfigs();
+    motor.getConfigurator().refresh(motorOutput);
+    motorOutput.NeutralMode = NeutralModeValue.Coast;
+    motor.getConfigurator().apply(motorOutput);
   }
 
-  private void configureMotors() {
-    var configuration = new TalonFXConfiguration();
-    configuration.MotorOutput.NeutralMode = NeutralModeValue.Coast;
-    configuration.MotorOutput.Inverted = InvertedValue.CounterClockwise_Positive;
-    configuration.CurrentLimits.StatorCurrentLimit = 40;
-    configuration.CurrentLimits.StatorCurrentLimitEnable = true;
-    configuration.CurrentLimits.SupplyCurrentLimit = 40;
-    configuration.CurrentLimits.SupplyCurrentLimitEnable = true;
-    motor.getConfigurator().apply(configuration);
+  /** Coast-out control request, sent every loop while enabled (the default command). */
+  public Command coast() {
+    return run(() -> motor.setControl(coastOut)).withName("Coast");
   }
 
-  public Command runClockwise() {
-    return Commands.run(() -> {
-      motor.setControl(request.withOutput(CLOCKWISE));
-    }, this);
+  /** Runs the motor at a fixed duty cycle; unused by default, handy for bench tests. */
+  public Command runAt(double dutyCycleOutput) {
+    return run(() -> motor.setControl(dutyCycle.withOutput(dutyCycleOutput))).withName("RunAt");
   }
-
-  public Command runCounterClockwise() {
-    return Commands.run(() -> {
-      motor.setControl(request.withOutput(COUNTERCLOCKWISE));
-    }, this);
-  }
-
-  public Command stopMotors() {
-    return Commands.run(() -> {
-      stop();
-    }, this);
-  }
-
-  public void stop() {
-    motor.stopMotor();
-  }
-
 }

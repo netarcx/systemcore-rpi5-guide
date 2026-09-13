@@ -3,7 +3,10 @@
 Deploy this once and Phoenix Tuner X can talk to the SystemCore: on SystemCore the Phoenix
 diagnostic server is not an OS package, it is started by the Phoenix 6 library inside the
 robot program as soon as one Phoenix device is constructed (`TestSubsystem` creates a
-`TalonFX` with ID 1 on `CANBus.systemcore(0)` = `can_s0`, the first USB-CAN adapter).
+`TalonFXS` with CAN ID 2 on `CANBus.systemcore(0)` = `can_s0`, the first USB-CAN adapter).
+While the robot is enabled, the subsystem's default command sends `CoastOut` to that Talon FXS
+every loop (bridge off, shaft free); its neutral mode is written as Coast, and nothing else on
+the device is touched (motor arrangement, limits and inversion stay as set in Tuner X).
 Replace it with your real robot code whenever you like — this is only a stopgap.
 
 Derived from BobcatRobotics/SystemCore-Clone's `ctre-commands-v2` example (WPILib BSD).

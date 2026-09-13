@@ -9,15 +9,16 @@ import org.wpilib.command2.Command;
 import org.wpilib.command2.Commands;
 
 /**
- * Minimal container: one subsystem that owns one Phoenix device. Constructing that device is what
- * starts the Phoenix diagnostic server (port 1250) that Tuner X connects to. No controller bindings
- * and no autonomous, so there is nothing to warn about when no Driver Station is attached.
+ * Minimal container: one subsystem that owns one Talon FXS. Constructing that device is what starts
+ * the Phoenix diagnostic server (port 1250) that Tuner X connects to. The subsystem's default
+ * command sends coast-out to the Talon FXS whenever the robot is enabled (default commands do not
+ * run while disabled). No controller bindings and no autonomous.
  */
 public class RobotContainer {
   private final TestSubsystem testSubsystem = new TestSubsystem();
 
   public RobotContainer() {
-    testSubsystem.setDefaultCommand(testSubsystem.stopMotors());
+    testSubsystem.setDefaultCommand(testSubsystem.coast());
   }
 
   public Command getAutonomousCommand() {
