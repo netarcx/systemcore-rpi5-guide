@@ -67,12 +67,6 @@ public class Robot extends TimedRobot {
           + RobotState.getRobotMode() + " phoenixEnable=" + Unmanaged.getEnableState());
     }
   }
-    if (enabled != wasEnabled) {
-      wasEnabled = enabled;
-      System.out.println("[robot] DriverStation " + (enabled ? "ENABLED" : "DISABLED")
-          + (enabled ? " (" + (DriverStation.isAutonomous() ? "autonomous" : DriverStation.isTest() ? "test" : "teleop") + "), feeding Phoenix enable" : ""));
-    }
-  }
 
   /** This function is called once each time the robot enters Disabled mode. */
   @Override
