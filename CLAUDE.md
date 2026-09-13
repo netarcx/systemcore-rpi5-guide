@@ -191,15 +191,25 @@ carries `bcm2712-rpi-5-b.dtb`, an `[all]` config.txt section, and a real `cmdlin
 - Phoenix / CTRE on SystemCore: the Phoenix diagnostic server that Tuner X talks to is part
   of the robot program (Phoenix 6 vendordep), so there is nothing to pre-install; Tuner X
   needs a deployed program that constructs a Phoenix 6 device. `examples/phoenix-tuner-robot/`
-  is that program (WPILib/GradleRIO 2027.0.0-alpha-6 + Phoenix 26.50.0-alpha-1 — no Phoenix
-  build exists for Alpha 7 yet, and an Alpha 6 program verifiably runs on build 210: HAL init,
+  is that program (WPILib/GradleRIO **2027.0.0-alpha-7** + Phoenix 26.50.0-alpha-1 with the
+  vendordep's `wpilibYear` overridden to `2027_alpha7`, because CTRE has no Alpha 7 build yet;
+  GradleRIO otherwise refuses it). **Alpha 7 is mandatory on build 210, not just recommended:**
+  `MrcCommDaemon` (210) only writes bit 0 (enabled) into `/dev/mrccan/controldata` — and so
+  into the CAN heartbeat — while the program feeds `/Netcomm/Control/WatchdogActive`, an NT
+  topic the Alpha 7 HAL publishes and the Alpha 6 HAL does not (`strings` on both binaries).
+  An Alpha 6 program therefore runs, sees itself enabled, but Tuner X shows every device
+  `Robot Enable: Disabled` and the daemon E-stops. Both HALs otherwise start fine on 210:
   NT on 5810, `[phoenix-diagnostics] Server 2026.50.0 ... running on port: 1250`, answers
-  `http://<pi>:1250/?action=getversion` with `"System":"Systemcore"`). Build with
+  `http://<pi>:1250/?action=getversion` with `"System":"Systemcore"`. Build with
   `JAVA_HOME=~/wpilib/2027/jdk` (JDK 25), deploy with `./gradlew deploy -PsystemcoreHost=<ip>`
   (GradleRIO's SystemCore target: user/password `systemcore`, jar → `/home/systemcore/wpilib/
   classpath`, JNI libs → `/home/systemcore/wpilib/third-party/lib`, writes `robotCommand`,
-  enables+starts `robot.service`). Commands v2 in Alpha 6 throws `Default commands must
-  require their subsystem!` for `Commands.run(fn)` without a requirement — pass the subsystem.
+  enables+starts `robot.service`). Alpha 7 template differences: `application` plugin,
+  `debugJni` lives on the WPILibJavaArtifact, `RobotBase.startRobot(Robot::new)`,
+  `org.wpilib.driverstation.RobotState.isEnabled()` (no `DriverStation.isEnabled`). The
+  heartbeat module's control word (`controldata_store`, hex text): bit 0 enabled, bits 1-4
+  mode flags, `/dev/mrccan/enabledro` reads back `0`/`1`, `controldataro` the last word
+  (`1000510` = disabled).
   The Pi's sshd (OpenSSH ≥ 9.8, `PerSourcePenalties`) answers `Not allowed at this time` for
   ~5–10 min after a burst of connection probes (e.g. `nc -z` on port 22) — wait or reboot. Phoenix's default SystemCore
   bus is `can_s1` (`CANBus.systemCore(n)` selects `can_s<n>`). CTRE's dashboard-installable

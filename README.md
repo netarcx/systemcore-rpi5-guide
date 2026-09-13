@@ -312,10 +312,12 @@ Nothing Phoenix-specific is (or can be) pre-installed in the image:
   at least one Phoenix 6 device and Tuner X can connect; the roboRIO-style "temporary
   diagnostic server" is not available on SystemCore. Until you have your own code,
   deploy [`examples/phoenix-tuner-robot`](examples/phoenix-tuner-robot/) — a minimal
-  WPILib 2027 Alpha 6 + Phoenix 6 26.50.0-alpha-1 program that starts the diagnostic server
-  on port 1250 (verified on build 210; `./gradlew deploy -PsystemcoreHost=<pi-ip>`), then
-  point Tuner X at the Pi's IP address. There is no Phoenix build for WPILib Alpha 7 yet,
-  which is why the example stays on Alpha 6.
+  WPILib 2027 **Alpha 7** + Phoenix 6 program that starts the diagnostic server on port 1250
+  (`./gradlew deploy -PsystemcoreHost=<pi-ip>`), then point Tuner X at the Pi's IP address.
+  Alpha 7 is required: build 210 only enables the CAN heartbeat for a program whose HAL feeds
+  the daemon's watchdog, which Alpha 6 does not do (devices stay `Robot Enable: Disabled`).
+  CTRE has no Phoenix build for Alpha 7 yet, so the example overrides the vendordep's year —
+  see its README.
 - **Bus selection** — `CANBus.systemCore(n)` picks `can_s<n>`; a device constructed without a
   bus uses Phoenix's SystemCore default, which is `can_s1`, so with a single USB-CAN adapter
   (renamed `can_s0`) pass the bus explicitly.

@@ -4,62 +4,44 @@
 
 package first.robot;
 
-import org.wpilib.driverstation.DriverStation;
-import org.wpilib.framework.TimedRobot;
-import org.wpilib.system.DataLogManager;
-import org.wpilib.command2.*;
+import com.ctre.phoenix6.CANBus;
+import com.ctre.phoenix6.configs.MotorOutputConfigs;
+import com.ctre.phoenix6.controls.CoastOut;
+import com.ctre.phoenix6.hardware.TalonFXS;
+import com.ctre.phoenix6.signals.NeutralModeValue;
 import com.ctre.phoenix6.unmanaged.Unmanaged;
 import org.wpilib.driverstation.RobotState;
+import org.wpilib.framework.TimedRobot;
+
 /**
- * The methods in this class are called automatically corresponding to each mode, as described in
- * the TimedRobot documentation. If you change the name of this class or the package after creating
- * this project, you must also update the Main.java file in the project.
+ * Minimal robot program for a SystemCore on a Pi 5B: one Talon FXS (CAN ID 2 on can_s0). Its
+ * existence starts the Phoenix diagnostic server that Tuner X connects to; while the robot is
+ * enabled it is held in coast-out. Plain TimedRobot, no command framework.
  */
 public class Robot extends TimedRobot {
-  private Command autonomousCommand;
+  private static final int TALON_ID = 2;
+  private static final int CAN_BUS = 0; // can_s0
 
-  private final RobotContainer robotContainer;
-
-  /**
-   * This function is run when the robot is first started up and should be used for any
-   * initialization code.
-   */
-  public Robot() {
-    // Instantiate our RobotContainer.  This will perform all our button bindings, and put our
-    // autonomous chooser on the dashboard.
-    robotContainer = new RobotContainer();
-
-    // Start recording to data log
-    DataLogManager.start();
-
-    // Record DS control and joystick data.
-    // Change to `false` to not record joystick data.
-    DriverStation.startDataLog(DataLogManager.getLog(), true);
-  }
-
-  /**
-   * This function is called every 20 ms, no matter the mode. Use this for items like diagnostics
-   * that you want ran during disabled, autonomous, teleoperated and test.
-   *
-   * <p>This runs after the mode specific periodic functions, but before LiveWindow and
-   * SmartDashboard integrated updating.
-   */
+  private final TalonFXS motor = new TalonFXS(TALON_ID, CANBus.systemcore(CAN_BUS));
+  private final CoastOut coastOut = new CoastOut();
   private boolean wasEnabled;
+
+  public Robot() {
+    // Only the neutral mode is written; motor arrangement, limits and inversion set in Tuner X
+    // are left alone (a full TalonFXSConfiguration would reset the arrangement to Disabled).
+    var motorOutput = new MotorOutputConfigs();
+    motor.getConfigurator().refresh(motorOutput);
+    motorOutput.NeutralMode = NeutralModeValue.Coast;
+    motor.getConfigurator().apply(motorOutput);
+  }
 
   @Override
   public void robotPeriodic() {
-    // Runs the Scheduler.  This is responsible for polling buttons, adding newly-scheduled
-    // commands, running already-scheduled commands, removing finished or interrupted commands,
-    // and running subsystem periodic() methods.  This must be called from the robot's periodic
-    // block in order for anything in the Command-based framework to work.
-    CommandScheduler.getInstance().run();
-
-    // Tell Phoenix the robot is enabled so it sends its enable frame to the devices along with
-    // the FRC heartbeat. On a roboRIO this is automatic; on the SystemCore alpha build it is
-    // fed explicitly here every loop (100 ms timeout, so devices disable if the loop stalls).
     boolean enabled = RobotState.isEnabled();
     if (enabled) {
+      // Phoenix's enable frame, alongside the FRC heartbeat the SystemCore sends.
       Unmanaged.feedEnable(100);
+      motor.setControl(coastOut);
     }
     if (enabled != wasEnabled) {
       wasEnabled = enabled;
@@ -67,51 +49,4 @@ public class Robot extends TimedRobot {
           + RobotState.getRobotMode() + " phoenixEnable=" + Unmanaged.getEnableState());
     }
   }
-
-  /** This function is called once each time the robot enters Disabled mode. */
-  @Override
-  public void disabledInit() {}
-
-  @Override
-  public void disabledPeriodic() {}
-
-  /** This autonomous runs the autonomous command selected by your {@link RobotContainer} class. */
-  @Override
-  public void autonomousInit() {
-    autonomousCommand = robotContainer.getAutonomousCommand();
-
-    // schedule the autonomous command (example)
-    if (autonomousCommand != null) {
-      CommandScheduler.getInstance().schedule(autonomousCommand);
-    }
-  }
-
-  /** This function is called periodically during autonomous. */
-  @Override
-  public void autonomousPeriodic() {}
-
-  @Override
-  public void teleopInit() {
-    // This makes sure that the autonomous stops running when
-    // teleop starts running. If you want the autonomous to
-    // continue until interrupted by another command, remove
-    // this line or comment it out.
-    if (autonomousCommand != null) {
-      CommandScheduler.getInstance().cancel(autonomousCommand);
-    }
-  }
-
-  /** This function is called periodically during operator control. */
-  @Override
-  public void teleopPeriodic() {}
-
-  @Override
-  public void utilityInit() {
-    // Cancels all running commands at the start of utility mode.
-    CommandScheduler.getInstance().cancelAll();
-  }
-
-  /** This function is called periodically during utility mode. */
-  @Override
-  public void utilityPeriodic() {}
 }

@@ -2,12 +2,12 @@
 
 Deploy this once and Phoenix Tuner X can talk to the SystemCore: on SystemCore the Phoenix
 diagnostic server is not an OS package, it is started by the Phoenix 6 library inside the
-robot program as soon as one Phoenix device is constructed (`TestSubsystem` creates a
-`TalonFXS` with CAN ID 2 on `CANBus.systemcore(0)` = `can_s0`, the first USB-CAN adapter).
-While the robot is enabled, the subsystem's default command sends `CoastOut` to that Talon FXS
-every loop (bridge off, shaft free); its neutral mode is written as Coast, and nothing else on
-the device is touched (motor arrangement, limits and inversion stay as set in Tuner X).
-Replace it with your real robot code whenever you like — this is only a stopgap.
+robot program as soon as one Phoenix device is constructed (`Robot` creates a `TalonFXS` with
+CAN ID 2 on `CANBus.systemcore(0)` = `can_s0`, the first USB-CAN adapter). It is a plain
+`TimedRobot`: while the robot is enabled it calls `Unmanaged.feedEnable` and sends `CoastOut`
+to that Talon FXS every loop (bridge off, shaft free); the neutral mode is written as Coast and
+nothing else on the device is touched (motor arrangement, limits and inversion stay as set in
+Tuner X). Replace it with your real robot code whenever you like — this is only a stopgap.
 
 Derived from BobcatRobotics/SystemCore-Clone's `ctre-commands-v2` example (WPILib BSD).
 
@@ -15,14 +15,21 @@ Derived from BobcatRobotics/SystemCore-Clone's `ctre-commands-v2` example (WPILi
 
 | | |
 | --- | --- |
-| WPILib / GradleRIO | 2027.0.0-alpha-6 (the newest alpha CTRE has a Phoenix build for) |
-| Phoenix 6 | 26.50.0-alpha-1 (`vendordeps/Phoenix6-26.50.0-alpha-1.json`) |
+| WPILib / GradleRIO | 2027.0.0-alpha-7 — **required** by SystemCore build 210 |
+| Phoenix 6 | 26.50.0-alpha-1 (`vendordeps/Phoenix6-26.50.0-alpha-1.json`, see note) |
 | JDK | 25 (`~/wpilib/2027/jdk` from the WPILib installer) |
 
-WPILib 2027 Alpha 7 is what SystemCore build 210 officially asks for, but as of Sept 2026
-there is no Phoenix release for Alpha 7 ("Alpha 6 and prior vendordeps will not work with
-Alpha 7"). This Alpha 6 program is what was verified against build 210 on a Pi 5B; when
-CTRE ships an Alpha 7 build, bump the GradleRIO version and the vendordep together.
+**Why Alpha 7 is not optional:** build 210's `MrcCommDaemon` only puts "enabled" into the
+CAN heartbeat while the robot program feeds a watchdog over NetworkTables
+(`/Netcomm/Control/WatchdogActive`). The Alpha 7 HAL does that; the Alpha 6 HAL does not, so
+an Alpha 6 program runs, thinks it is enabled, but every CTRE device stays
+`Robot Enable: Disabled` in Tuner X and the daemon eventually E-stops the robot.
+
+**Phoenix note:** as of Sept 2026 CTRE has published no Phoenix build for Alpha 7, and
+GradleRIO Alpha 7 refuses the Alpha 5/6 vendordep by its year field. The JSON here has
+`wpilibYear` changed to `2027_alpha7` so the build runs; WPILib's check warns that this is
+unsupported. It compiles and the program starts and talks to the devices on build 210. Swap in
+CTRE's real Alpha 7 vendordep as soon as it exists.
 
 ## Build and deploy
 
